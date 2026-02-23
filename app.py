@@ -66,12 +66,18 @@ class AudioCapture:
                 "soundcard no está disponible. Instálalo con: pip install soundcard"
             )
 
+        # Find the speaker, then get its loopback microphone
         if device_name:
             speakers = sc.all_speakers()
             match = [s for s in speakers if s.name == device_name]
-            self._loopback = match[0] if match else sc.default_speaker()
+            speaker = match[0] if match else sc.default_speaker()
         else:
-            self._loopback = sc.default_speaker()
+            speaker = sc.default_speaker()
+
+        # Get loopback mic for the selected speaker
+        self._loopback = sc.get_microphone(
+            speaker.id, include_loopback=True
+        )
 
         self._thread = threading.Thread(target=self._record_loop, daemon=True)
         self._thread.start()
