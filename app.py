@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import os
+import queue
 import threading
 import struct
 import time
@@ -231,8 +232,13 @@ class SubtitleApp(ctk.CTk):
         self._audio = AudioCapture()
         self._service: TranscriptionService | None = None
         self._is_running = False
-        self._processing_lock = threading.Lock()
         self._debug_enabled = False
+
+        # Pipeline queues
+        self._stt_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=5)
+        self._translate_queue: queue.Queue[str | None] = queue.Queue(maxsize=5)
+        self._stt_thread: threading.Thread | None = None
+        self._translate_thread: threading.Thread | None = None
 
         self._build_ui()
         self._load_api_key()
@@ -430,15 +436,33 @@ class SubtitleApp(ctk.CTk):
             )
             self._log("[DEBUG] TranscriptionService creado OK")
 
+            # Clear queues
+            for q in (self._stt_queue, self._translate_queue):
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
+
+            self._is_running = True
+
+            # Launch pipeline workers
+            self._stt_thread = threading.Thread(target=self._stt_worker, daemon=True)
+            self._stt_thread.start()
+            self._translate_thread = threading.Thread(target=self._translate_worker, daemon=True)
+            self._translate_thread.start()
+            self._log("[DEBUG] Pipeline STT + Traducción iniciado")
+
             self._log("[DEBUG] Iniciando captura de audio...")
             try:
                 self._audio.start(self._on_audio_chunk, device_name)
             except Exception as e:
+                self._is_running = False
+                self._stt_queue.put(None)
                 self._set_status(f"⚠ Error de audio: {e}")
                 self._log(f"[DEBUG] Error en audio.start: {type(e).__name__}: {e}")
                 return
 
-            self._is_running = True
             self._start_btn.configure(
                 text="⏹  Detener", fg_color="#c0392b", hover_color="#962d22"
             )
@@ -451,13 +475,16 @@ class SubtitleApp(ctk.CTk):
     def _stop_capture(self):
         self._audio.stop()
         self._is_running = False
+        # Send poison pills to stop workers
+        self._stt_queue.put(None)
+        self._translate_queue.put(None)
         self._start_btn.configure(
             text="▶  Iniciar", fg_color="#2d8a4e", hover_color="#236b3e"
         )
         self._set_status("Estado: Detenido")
 
     def _on_audio_chunk(self, wav_bytes: bytes | None, error: str | None, debug_msg: str | None = None):
-        """Called from the audio thread when a chunk is ready."""
+        """Called from the audio thread — enqueues audio for the STT worker."""
         if debug_msg:
             self.after(0, self._log, debug_msg)
             if wav_bytes is None and error is None:
@@ -469,49 +496,79 @@ class SubtitleApp(ctk.CTk):
             self.after(0, self._stop_capture)
             return
 
-        if not self._processing_lock.acquire(blocking=False):
-            return
+        # Enqueue for STT; drop if queue is full (avoid backpressure)
         try:
-            self._process_chunk(wav_bytes)
-        finally:
-            self._processing_lock.release()
+            self._stt_queue.put_nowait(wav_bytes)
+        except queue.Full:
+            self.after(0, self._log, "[DEBUG] STT queue llena, chunk descartado")
 
-    def _process_chunk(self, wav_bytes: bytes):
-        """Transcribe + translate a single audio chunk (runs in audio thread)."""
-        if not self._service or not self._is_running:
-            return
+    # -- Pipeline workers --------------------------------------------------
 
-        self._service.update_models(
-            self._whisper_combo.get(), self._trans_combo.get()
-        )
+    def _stt_worker(self):
+        """Thread: reads audio from stt_queue, transcribes, enqueues text for translation."""
+        while self._is_running:
+            try:
+                wav_bytes = self._stt_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            if wav_bytes is None:
+                break
 
-        self.after(0, self._set_status, "📝 Transcribiendo...")
-        self.after(0, self._log, f"[DEBUG] Enviando audio a Whisper ({len(wav_bytes)} bytes)...")
+            if not self._service:
+                continue
 
-        try:
-            jp_text = self._service.transcribe(wav_bytes)
-        except Exception as e:
-            self.after(0, self._set_status, f"⚠ Error STT: {e}")
-            self.after(0, self._log, f"[ERROR] STT: {type(e).__name__}: {e}")
-            return
+            self._service.update_models(
+                self._whisper_combo.get(), self._trans_combo.get()
+            )
 
-        self.after(0, self._log, f"[DEBUG] Whisper respondió: '{jp_text}'")
+            self.after(0, self._set_status, "📝 Transcribiendo...")
+            self.after(0, self._log, f"[DEBUG] Enviando audio a Whisper ({len(wav_bytes)} bytes)...")
 
-        if not jp_text:
+            try:
+                jp_text = self._service.transcribe(wav_bytes)
+            except Exception as e:
+                self.after(0, self._log, f"[ERROR] STT: {type(e).__name__}: {e}")
+                continue
+
+            self.after(0, self._log, f"[DEBUG] Whisper respondió: '{jp_text}'")
+
+            if not jp_text:
+                self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
+                continue
+
+            # Enqueue for translation
+            try:
+                self._translate_queue.put_nowait(jp_text)
+            except queue.Full:
+                self.after(0, self._log, "[DEBUG] Cola traducción llena, texto descartado")
+
+        self.after(0, self._log, "[DEBUG] STT worker finalizado")
+
+    def _translate_worker(self):
+        """Thread: reads Japanese text, translates to Spanish, shows subtitle."""
+        while self._is_running:
+            try:
+                jp_text = self._translate_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            if jp_text is None:
+                break
+
+            if not self._service:
+                continue
+
+            self.after(0, self._set_status, "🌐 Traduciendo...")
+
+            try:
+                es_text = self._service.translate(jp_text)
+            except Exception as e:
+                self.after(0, self._log, f"[ERROR] Traducción: {type(e).__name__}: {e}")
+                continue
+
+            self.after(0, self._append_subtitle, jp_text, es_text)
             self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
-            return
 
-        self.after(0, self._set_status, "🌐 Traduciendo...")
-
-        try:
-            es_text = self._service.translate(jp_text)
-        except Exception as e:
-            self.after(0, self._set_status, f"⚠ Error traducción: {e}")
-            self.after(0, self._log, f"[ERROR] Traducción: {type(e).__name__}: {e}")
-            return
-
-        self.after(0, self._append_subtitle, jp_text, es_text)
-        self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
+        self.after(0, self._log, "[DEBUG] Translate worker finalizado")
 
     def _append_subtitle(self, jp_text: str, es_text: str):
         self._subtitle_box.configure(state="normal")
@@ -536,7 +593,10 @@ class SubtitleApp(ctk.CTk):
     # -- Cleanup -----------------------------------------------------------
 
     def destroy(self):
+        self._is_running = False
         self._audio.stop()
+        self._stt_queue.put(None)
+        self._translate_queue.put(None)
         super().destroy()
 
 
