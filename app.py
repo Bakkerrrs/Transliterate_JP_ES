@@ -19,8 +19,10 @@ import numpy as np
 
 try:
     import soundcard as sc
-except Exception:
+    _sc_error = None
+except Exception as _e:
     sc = None
+    _sc_error = str(_e)
 
 from openai import OpenAI
 
@@ -82,6 +84,8 @@ class AudioCapture:
 
     def _record_loop(self):
         num_frames = self.SAMPLE_RATE * self.CHUNK_SECONDS
+        if self._on_chunk:
+            self._on_chunk(None, None, "[DEBUG] _record_loop iniciado")
         try:
             mic = self._loopback.recorder(
                 samplerate=self.SAMPLE_RATE,
@@ -90,17 +94,24 @@ class AudioCapture:
             )
         except Exception as e:
             if self._on_chunk:
-                self._on_chunk(None, str(e))
+                self._on_chunk(None, f"Error creando recorder: {type(e).__name__}: {e}")
             return
 
+        if self._on_chunk:
+            self._on_chunk(None, None, "[DEBUG] Recorder creado, grabando...")
+
         with mic:
+            chunk_count = 0
             while self._running:
                 try:
                     data = mic.record(numframes=num_frames)
+                    chunk_count += 1
                     audio_float = data[:, 0] if data.ndim > 1 else data
                     wav_bytes = self._float_to_wav(audio_float)
 
                     rms = np.sqrt(np.mean(audio_float ** 2))
+                    if self._on_chunk:
+                        self._on_chunk(None, None, f"[DEBUG] Chunk #{chunk_count} - RMS: {rms:.6f}")
                     if rms < 0.001:
                         continue
 
@@ -108,7 +119,7 @@ class AudioCapture:
                         self._on_chunk(wav_bytes, None)
                 except Exception as e:
                     if self._on_chunk and self._running:
-                        self._on_chunk(None, str(e))
+                        self._on_chunk(None, f"Error en record: {type(e).__name__}: {e}")
                     break
 
     def _float_to_wav(self, audio: np.ndarray) -> bytes:
@@ -359,33 +370,47 @@ class SubtitleApp(ctk.CTk):
             self._start_capture()
 
     def _start_capture(self):
-        api_key = self._api_key_entry.get().strip()
-        if not api_key:
-            self._set_status("⚠ Ingresa tu API Key de OpenAI")
-            return
-
-        device_name = self._device_combo.get()
-        if device_name == "(no disponible)":
-            self._set_status("⚠ No hay dispositivos de audio disponibles")
-            return
-
-        self._service = TranscriptionService(
-            api_key=api_key,
-            whisper_model=self._whisper_combo.get(),
-            translation_model=self._trans_combo.get(),
-        )
-
         try:
-            self._audio.start(self._on_audio_chunk, device_name)
-        except RuntimeError as e:
-            self._set_status(f"⚠ Error de audio: {e}")
-            return
+            api_key = self._api_key_entry.get().strip()
+            if not api_key:
+                self._set_status("⚠ Ingresa tu API Key de OpenAI")
+                return
 
-        self._is_running = True
-        self._start_btn.configure(
-            text="⏹  Detener", fg_color="#c0392b", hover_color="#962d22"
-        )
-        self._set_status("🎧 Capturando audio del sistema...")
+            device_name = self._device_combo.get()
+            self._log(f"[DEBUG] Dispositivo seleccionado: '{device_name}'")
+            self._log(f"[DEBUG] soundcard disponible: {sc is not None}")
+            if _sc_error:
+                self._log(f"[DEBUG] Error al importar soundcard: {_sc_error}")
+
+            if device_name == "(no disponible)":
+                self._set_status("⚠ No hay dispositivos de audio disponibles")
+                return
+
+            self._log("[DEBUG] Creando TranscriptionService...")
+            self._service = TranscriptionService(
+                api_key=api_key,
+                whisper_model=self._whisper_combo.get(),
+                translation_model=self._trans_combo.get(),
+            )
+            self._log("[DEBUG] TranscriptionService creado OK")
+
+            self._log("[DEBUG] Iniciando captura de audio...")
+            try:
+                self._audio.start(self._on_audio_chunk, device_name)
+            except Exception as e:
+                self._set_status(f"⚠ Error de audio: {e}")
+                self._log(f"[DEBUG] Error en audio.start: {type(e).__name__}: {e}")
+                return
+
+            self._is_running = True
+            self._start_btn.configure(
+                text="⏹  Detener", fg_color="#c0392b", hover_color="#962d22"
+            )
+            self._set_status("🎧 Capturando audio del sistema...")
+            self._log("[DEBUG] Captura iniciada correctamente")
+        except Exception as e:
+            self._set_status(f"⚠ Error inesperado: {e}")
+            self._log(f"[DEBUG] Excepción no controlada: {type(e).__name__}: {e}")
 
     def _stop_capture(self):
         self._audio.stop()
@@ -395,10 +420,16 @@ class SubtitleApp(ctk.CTk):
         )
         self._set_status("Estado: Detenido")
 
-    def _on_audio_chunk(self, wav_bytes: bytes | None, error: str | None):
+    def _on_audio_chunk(self, wav_bytes: bytes | None, error: str | None, debug_msg: str | None = None):
         """Called from the audio thread when a chunk is ready."""
+        if debug_msg:
+            self.after(0, self._log, debug_msg)
+            if wav_bytes is None and error is None:
+                return
+
         if error:
             self.after(0, self._set_status, f"⚠ Audio error: {error}")
+            self.after(0, self._log, f"[ERROR] {error}")
             self.after(0, self._stop_capture)
             return
 
@@ -419,12 +450,16 @@ class SubtitleApp(ctk.CTk):
         )
 
         self.after(0, self._set_status, "📝 Transcribiendo...")
+        self.after(0, self._log, f"[DEBUG] Enviando audio a Whisper ({len(wav_bytes)} bytes)...")
 
         try:
             jp_text = self._service.transcribe(wav_bytes)
         except Exception as e:
             self.after(0, self._set_status, f"⚠ Error STT: {e}")
+            self.after(0, self._log, f"[ERROR] STT: {type(e).__name__}: {e}")
             return
+
+        self.after(0, self._log, f"[DEBUG] Whisper respondió: '{jp_text}'")
 
         if not jp_text:
             self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
@@ -436,6 +471,7 @@ class SubtitleApp(ctk.CTk):
             es_text = self._service.translate(jp_text)
         except Exception as e:
             self.after(0, self._set_status, f"⚠ Error traducción: {e}")
+            self.after(0, self._log, f"[ERROR] Traducción: {type(e).__name__}: {e}")
             return
 
         self.after(0, self._append_subtitle, jp_text, es_text)
@@ -446,6 +482,13 @@ class SubtitleApp(ctk.CTk):
         self._subtitle_box.insert("end", f"🇯🇵  {jp_text}\n")
         self._subtitle_box.insert("end", f"🇪🇸  {es_text}\n")
         self._subtitle_box.insert("end", "─" * 60 + "\n\n")
+        self._subtitle_box.see("end")
+        self._subtitle_box.configure(state="disabled")
+
+    def _log(self, message: str):
+        """Append a debug message to the subtitle box."""
+        self._subtitle_box.configure(state="normal")
+        self._subtitle_box.insert("end", f"{message}\n")
         self._subtitle_box.see("end")
         self._subtitle_box.configure(state="disabled")
 
