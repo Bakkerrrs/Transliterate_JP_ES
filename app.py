@@ -5,6 +5,8 @@ Captures system audio (loopback), transcribes Japanese speech using OpenAI Whisp
 and translates to Spanish using OpenAI GPT models.
 """
 
+from __future__ import annotations
+
 import io
 import threading
 import struct
