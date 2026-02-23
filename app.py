@@ -8,11 +8,13 @@ and translates to Spanish using OpenAI GPT models.
 from __future__ import annotations
 
 import io
+import os
 import threading
 import struct
 import time
 import wave
 from collections import deque
+from pathlib import Path
 
 import customtkinter as ctk
 import numpy as np
@@ -230,8 +232,10 @@ class SubtitleApp(ctk.CTk):
         self._service: TranscriptionService | None = None
         self._is_running = False
         self._processing_lock = threading.Lock()
+        self._debug_enabled = False
 
         self._build_ui()
+        self._load_api_key()
 
     # -- UI Construction ---------------------------------------------------
 
@@ -337,22 +341,48 @@ class SubtitleApp(ctk.CTk):
 
         self._subtitle_box = ctk.CTkTextbox(
             subtitle_frame,
-            font=ctk.CTkFont(size=16),
+            font=ctk.CTkFont(size=22),
             wrap="word",
             state="disabled",
         )
         self._subtitle_box.grid(row=1, column=0, padx=8, pady=8, sticky="nsew")
 
         # -- Status bar --
+        status_frame = ctk.CTkFrame(self, fg_color="transparent")
+        status_frame.grid(row=4, column=0, padx=16, pady=(0, 8), sticky="ew")
+        status_frame.grid_columnconfigure(0, weight=1)
+
         self._status_label = ctk.CTkLabel(
-            self,
+            status_frame,
             text="Estado: Detenido",
             font=ctk.CTkFont(size=12),
             anchor="w",
         )
-        self._status_label.grid(row=4, column=0, padx=16, pady=(0, 8), sticky="ew")
+        self._status_label.grid(row=0, column=0, sticky="w")
+
+        self._debug_var = ctk.BooleanVar(value=False)
+        self._debug_check = ctk.CTkCheckBox(
+            status_frame,
+            text="Debug",
+            variable=self._debug_var,
+            command=self._toggle_debug,
+            width=70,
+            font=ctk.CTkFont(size=11),
+        )
+        self._debug_check.grid(row=0, column=1, sticky="e")
 
     # -- Actions -----------------------------------------------------------
+
+    def _load_api_key(self):
+        """Load API key from apikey.txt if it exists next to the script."""
+        key_path = Path(__file__).parent / "apikey.txt"
+        if key_path.is_file():
+            key = key_path.read_text(encoding="utf-8").strip()
+            if key:
+                self._api_key_entry.insert(0, key)
+
+    def _toggle_debug(self):
+        self._debug_enabled = self._debug_var.get()
 
     def _toggle_key_visibility(self):
         if self._show_key_var.get():
@@ -492,7 +522,9 @@ class SubtitleApp(ctk.CTk):
         self._subtitle_box.configure(state="disabled")
 
     def _log(self, message: str):
-        """Append a debug message to the subtitle box."""
+        """Append a message to the subtitle box. [DEBUG] messages only show if debug is on."""
+        if message.startswith("[DEBUG]") and not self._debug_enabled:
+            return
         self._subtitle_box.configure(state="normal")
         self._subtitle_box.insert("end", f"{message}\n")
         self._subtitle_box.see("end")
