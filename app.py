@@ -33,6 +33,21 @@ except Exception as _e:
     sc = None
     _sc_error = str(_e)
 
+# ---------------------------------------------------------------------------
+# Register NVIDIA DLL directories so Windows can find cublas64_12.dll, etc.
+# pip-installed nvidia-* packages place DLLs under site-packages/nvidia/…/bin
+# which is NOT on the default DLL search path.
+# ---------------------------------------------------------------------------
+if os.name == "nt":
+    import importlib.util as _ilu
+    for _pkg in ("nvidia.cublas", "nvidia.cudnn"):
+        _spec = _ilu.find_spec(_pkg)
+        if _spec and _spec.submodule_search_locations:
+            for _loc in _spec.submodule_search_locations:
+                _bin = os.path.join(_loc, "bin")
+                if os.path.isdir(_bin):
+                    os.add_dll_directory(_bin)
+
 try:
     from faster_whisper import WhisperModel
     _fw_available = True
