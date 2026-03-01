@@ -20,6 +20,19 @@ from pathlib import Path
 import customtkinter as ctk
 import numpy as np
 
+# numpy >=2.0 removed the binary mode of np.fromstring; soundcard still uses it.
+# Monkey-patch so soundcard works with modern numpy.
+if not hasattr(np, '_original_fromstring'):
+    _orig = np.fromstring
+
+    def _patched_fromstring(string, dtype=float, count=-1, *, sep='', like=None):
+        if isinstance(string, (bytes, bytearray)) and sep == '':
+            return np.frombuffer(string, dtype=dtype, count=count)
+        return _orig(string, dtype=dtype, count=count, sep=sep)
+
+    np._original_fromstring = _orig
+    np.fromstring = _patched_fromstring
+
 try:
     import soundcard as sc
     _sc_error = None
