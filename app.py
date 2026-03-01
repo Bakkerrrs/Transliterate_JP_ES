@@ -12,9 +12,16 @@ import os
 import queue
 import threading
 import time
+import warnings
 import wave
 from collections import deque
 from pathlib import Path
+
+# Suppress huggingface_hub symlink warning on Windows
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+# Suppress soundcard "data discontinuity" warnings (normal during loopback capture)
+warnings.filterwarnings("ignore", message="data discontinuity", module="soundcard")
 
 import customtkinter as ctk
 import numpy as np
