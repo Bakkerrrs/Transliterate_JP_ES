@@ -1,8 +1,8 @@
 """
 Transliterate JP→ES: Real-time Japanese audio to Spanish subtitle translator.
 
-Captures system audio (loopback), transcribes Japanese speech using OpenAI Whisper,
-and translates to Spanish using OpenAI GPT models.
+Captures system audio (loopback), transcribes Japanese speech using local
+faster-whisper, and translates to Spanish using OpenAI GPT with streaming output.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ import io
 import os
 import queue
 import threading
-import struct
 import time
 import wave
 from collections import deque
@@ -27,7 +26,28 @@ except Exception as _e:
     sc = None
     _sc_error = str(_e)
 
+try:
+    from faster_whisper import WhisperModel
+    _fw_available = True
+except ImportError:
+    _fw_available = False
+
 from openai import OpenAI
+
+
+# ---------------------------------------------------------------------------
+# Device detection for faster-whisper (CUDA / CPU)
+# ---------------------------------------------------------------------------
+
+def _detect_device() -> tuple[str, str]:
+    """Return (device, compute_type) for faster-whisper."""
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            return "cuda", "float16"
+    except Exception:
+        pass
+    return "cpu", "int8"
 
 
 # ---------------------------------------------------------------------------
@@ -144,44 +164,57 @@ class AudioCapture:
 
 
 # ---------------------------------------------------------------------------
-# OpenAI services: STT + Translation
+# Services: local Whisper STT + OpenAI GPT streaming translation
 # ---------------------------------------------------------------------------
 
-WHISPER_MODELS = ["whisper-1"]
+WHISPER_MODELS = ["large-v3", "medium", "small", "base", "tiny"]
 TRANSLATION_MODELS = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1-nano"]
 
 
 class TranscriptionService:
-    """Handles Whisper STT and GPT translation."""
+    """Local faster-whisper STT + OpenAI GPT streaming translation."""
 
     def __init__(self, api_key: str, whisper_model: str, translation_model: str):
         self.client = OpenAI(api_key=api_key)
-        self.whisper_model = whisper_model
+        self.whisper_model_name = whisper_model
         self.translation_model = translation_model
         self._context: deque[str] = deque(maxlen=5)
+        self._whisper: WhisperModel | None = None
 
-    def update_models(self, whisper_model: str, translation_model: str):
-        self.whisper_model = whisper_model
+    def load_whisper(self) -> tuple[str, str]:
+        """Load the faster-whisper model. Returns (device, compute_type)."""
+        if not _fw_available:
+            raise RuntimeError(
+                "faster-whisper no está instalado. "
+                "Instálalo con: pip install faster-whisper"
+            )
+        device, compute_type = _detect_device()
+        self._whisper = WhisperModel(
+            self.whisper_model_name,
+            device=device,
+            compute_type=compute_type,
+        )
+        return device, compute_type
+
+    def update_translation_model(self, translation_model: str):
         self.translation_model = translation_model
 
     def transcribe(self, wav_bytes: bytes) -> str:
-        audio_file = io.BytesIO(wav_bytes)
-        audio_file.name = "audio.wav"
-        response = self.client.audio.transcriptions.create(
-            model=self.whisper_model,
-            file=audio_file,
+        segments, _info = self._whisper.transcribe(
+            io.BytesIO(wav_bytes),
             language="ja",
-            response_format="text",
+            beam_size=5,
         )
-        return response.strip()
+        return "".join(s.text for s in segments).strip()
 
-    def translate(self, japanese_text: str) -> str:
+    def translate_stream(self, japanese_text: str):
+        """Yield translation tokens as they stream from GPT."""
         if not japanese_text:
-            return ""
+            return
 
         context_str = "\n".join(self._context) if self._context else "(sin contexto previo)"
 
-        response = self.client.chat.completions.create(
+        stream = self.client.chat.completions.create(
             model=self.translation_model,
             messages=[
                 {
@@ -205,11 +238,19 @@ class TranscriptionService:
             ],
             temperature=0.3,
             max_tokens=500,
+            stream=True,
         )
 
-        translation = response.choices[0].message.content.strip()
+        full_text: list[str] = []
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            token = delta.content if delta and delta.content else ""
+            if token:
+                full_text.append(token)
+                yield token
+
+        translation = "".join(full_text)
         self._context.append(f"JP: {japanese_text}\nES: {translation}")
-        return translation
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +275,9 @@ class SubtitleApp(ctk.CTk):
         self._is_running = False
         self._debug_enabled = False
 
-        # Pipeline queues
-        self._stt_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=5)
-        self._translate_queue: queue.Queue[str | None] = queue.Queue(maxsize=5)
+        # Pipeline queues: items are (payload, capture_time) or None (poison pill)
+        self._stt_queue: queue.Queue[tuple[bytes, float] | None] = queue.Queue(maxsize=5)
+        self._translate_queue: queue.Queue[tuple[str, float] | None] = queue.Queue(maxsize=5)
         self._stt_thread: threading.Thread | None = None
         self._translate_thread: threading.Thread | None = None
 
@@ -259,7 +300,7 @@ class SubtitleApp(ctk.CTk):
             row=0, column=0, padx=(12, 6), pady=8, sticky="w"
         )
         self._api_key_entry = ctk.CTkEntry(
-            config_frame, placeholder_text="sk-... (OpenAI API Key)", show="•", width=350
+            config_frame, placeholder_text="sk-... (OpenAI para traducción)", show="•", width=350
         )
         self._api_key_entry.grid(row=0, column=1, padx=6, pady=8, sticky="ew")
 
@@ -279,8 +320,8 @@ class SubtitleApp(ctk.CTk):
         model_frame.grid_columnconfigure(1, weight=1)
         model_frame.grid_columnconfigure(3, weight=1)
 
-        # Whisper model
-        ctk.CTkLabel(model_frame, text="Modelo STT:").grid(
+        # Whisper model (local)
+        ctk.CTkLabel(model_frame, text="Whisper (local):").grid(
             row=0, column=0, padx=(12, 6), pady=8, sticky="w"
         )
         self._whisper_combo = ctk.CTkComboBox(
@@ -289,8 +330,8 @@ class SubtitleApp(ctk.CTk):
         self._whisper_combo.set(WHISPER_MODELS[0])
         self._whisper_combo.grid(row=0, column=1, padx=6, pady=8, sticky="w")
 
-        # Translation model
-        ctk.CTkLabel(model_frame, text="Modelo Traducción:").grid(
+        # Translation model (GPT)
+        ctk.CTkLabel(model_frame, text="Traducción (GPT):").grid(
             row=0, column=2, padx=(24, 6), pady=8, sticky="w"
         )
         self._trans_combo = ctk.CTkComboBox(
@@ -446,12 +487,11 @@ class SubtitleApp(ctk.CTk):
 
             self._is_running = True
 
-            # Launch pipeline workers
+            # Launch pipeline workers (STT worker loads Whisper model before processing)
             self._stt_thread = threading.Thread(target=self._stt_worker, daemon=True)
             self._stt_thread.start()
             self._translate_thread = threading.Thread(target=self._translate_worker, daemon=True)
             self._translate_thread.start()
-            self._log("[DEBUG] Pipeline STT + Traducción iniciado")
 
             self._log("[DEBUG] Iniciando captura de audio...")
             try:
@@ -466,8 +506,7 @@ class SubtitleApp(ctk.CTk):
             self._start_btn.configure(
                 text="⏹  Detener", fg_color="#c0392b", hover_color="#962d22"
             )
-            self._set_status("🎧 Capturando audio del sistema...")
-            self._log("[DEBUG] Captura iniciada correctamente")
+            self._log("[DEBUG] Captura de audio iniciada")
         except Exception as e:
             self._set_status(f"⚠ Error inesperado: {e}")
             self._log(f"[DEBUG] Excepción no controlada: {type(e).__name__}: {e}")
@@ -496,33 +535,47 @@ class SubtitleApp(ctk.CTk):
             self.after(0, self._stop_capture)
             return
 
-        # Enqueue for STT; drop if queue is full (avoid backpressure)
+        # Enqueue with capture timestamp; drop if queue is full
         try:
-            self._stt_queue.put_nowait(wav_bytes)
+            self._stt_queue.put_nowait((wav_bytes, time.monotonic()))
         except queue.Full:
             self.after(0, self._log, "[DEBUG] STT queue llena, chunk descartado")
 
     # -- Pipeline workers --------------------------------------------------
 
     def _stt_worker(self):
-        """Thread: reads audio from stt_queue, transcribes, enqueues text for translation."""
+        """Thread: loads Whisper model, then transcribes audio chunks."""
+        self.after(0, self._set_status, "⏳ Cargando modelo Whisper...")
+        self.after(0, self._log,
+                   f"[DEBUG] Cargando faster-whisper '{self._service.whisper_model_name}'...")
+
+        try:
+            device, compute_type = self._service.load_whisper()
+        except Exception as e:
+            self.after(0, self._log,
+                       f"[ERROR] No se pudo cargar Whisper: {type(e).__name__}: {e}")
+            self.after(0, self._stop_capture)
+            return
+
+        self.after(0, self._log,
+                   f"[DEBUG] Whisper cargado (device={device}, compute={compute_type})")
+        self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
+
         while self._is_running:
             try:
-                wav_bytes = self._stt_queue.get(timeout=1)
+                item = self._stt_queue.get(timeout=1)
             except queue.Empty:
                 continue
-            if wav_bytes is None:
+            if item is None:
                 break
 
-            if not self._service:
-                continue
+            wav_bytes, t0 = item
 
-            self._service.update_models(
-                self._whisper_combo.get(), self._trans_combo.get()
-            )
+            self._service.update_translation_model(self._trans_combo.get())
 
             self.after(0, self._set_status, "📝 Transcribiendo...")
-            self.after(0, self._log, f"[DEBUG] Enviando audio a Whisper ({len(wav_bytes)} bytes)...")
+            self.after(0, self._log,
+                       f"[DEBUG] Transcribiendo audio ({len(wav_bytes)} bytes)...")
 
             try:
                 jp_text = self._service.transcribe(wav_bytes)
@@ -530,51 +583,76 @@ class SubtitleApp(ctk.CTk):
                 self.after(0, self._log, f"[ERROR] STT: {type(e).__name__}: {e}")
                 continue
 
-            self.after(0, self._log, f"[DEBUG] Whisper respondió: '{jp_text}'")
+            self.after(0, self._log, f"[DEBUG] Whisper: '{jp_text}'")
 
             if not jp_text:
                 self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
                 continue
 
-            # Enqueue for translation
+            # Enqueue for translation, carrying the original capture timestamp
             try:
-                self._translate_queue.put_nowait(jp_text)
+                self._translate_queue.put_nowait((jp_text, t0))
             except queue.Full:
                 self.after(0, self._log, "[DEBUG] Cola traducción llena, texto descartado")
 
         self.after(0, self._log, "[DEBUG] STT worker finalizado")
 
     def _translate_worker(self):
-        """Thread: reads Japanese text, translates to Spanish, shows subtitle."""
+        """Thread: streams GPT translation to the subtitle box."""
         while self._is_running:
             try:
-                jp_text = self._translate_queue.get(timeout=1)
+                item = self._translate_queue.get(timeout=1)
             except queue.Empty:
                 continue
-            if jp_text is None:
+            if item is None:
                 break
+
+            jp_text, t0 = item
 
             if not self._service:
                 continue
 
             self.after(0, self._set_status, "🌐 Traduciendo...")
+            self.after(0, self._begin_subtitle, jp_text)
 
             try:
-                es_text = self._service.translate(jp_text)
+                for token in self._service.translate_stream(jp_text):
+                    self.after(0, self._stream_token, token)
             except Exception as e:
                 self.after(0, self._log, f"[ERROR] Traducción: {type(e).__name__}: {e}")
+                self.after(0, self._end_subtitle, None)
                 continue
 
-            self.after(0, self._append_subtitle, jp_text, es_text)
+            elapsed = time.monotonic() - t0
+            self.after(0, self._end_subtitle, elapsed)
             self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
 
         self.after(0, self._log, "[DEBUG] Translate worker finalizado")
 
-    def _append_subtitle(self, jp_text: str, es_text: str):
+    # -- Subtitle display helpers ------------------------------------------
+
+    def _begin_subtitle(self, jp_text: str):
+        """Insert the JP line and start the ES line for streaming."""
         self._subtitle_box.configure(state="normal")
-        self._subtitle_box.insert("end", f"🇯🇵  {jp_text}\n")
-        self._subtitle_box.insert("end", f"🇪🇸  {es_text}\n")
-        self._subtitle_box.insert("end", "─" * 60 + "\n\n")
+        self._subtitle_box.insert("end", f"🇯🇵  {jp_text}\n🇪🇸  ")
+        self._subtitle_box.see("end")
+        self._subtitle_box.configure(state="disabled")
+
+    def _stream_token(self, token: str):
+        """Append a single streamed token to the current ES line."""
+        self._subtitle_box.configure(state="normal")
+        self._subtitle_box.insert("end", token)
+        self._subtitle_box.see("end")
+        self._subtitle_box.configure(state="disabled")
+
+    def _end_subtitle(self, elapsed: float | None):
+        """Close the current subtitle block with separator and optional timing."""
+        self._subtitle_box.configure(state="normal")
+        if elapsed is not None:
+            timing = f"{elapsed:.1f}".replace(".", ",")
+            self._subtitle_box.insert("end", f"\n{'─' * 50} ({timing} s)\n\n")
+        else:
+            self._subtitle_box.insert("end", f"\n{'─' * 60}\n\n")
         self._subtitle_box.see("end")
         self._subtitle_box.configure(state="disabled")
 
