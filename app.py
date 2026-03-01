@@ -189,13 +189,30 @@ class TranscriptionService:
         self._whisper: WhisperModel | None = None
 
     def load_whisper(self) -> tuple[str, str]:
-        """Load the faster-whisper model. Returns (device, compute_type)."""
+        """Load the faster-whisper model. Returns (device, compute_type).
+
+        Tries CUDA first; if GPU libraries (cuBLAS, etc.) are missing or
+        fail to load, falls back automatically to CPU.
+        """
         if not _fw_available:
             raise RuntimeError(
                 "faster-whisper no está instalado. "
                 "Instálalo con: pip install faster-whisper"
             )
         device, compute_type = _detect_device()
+
+        if device == "cuda":
+            try:
+                self._whisper = WhisperModel(
+                    self.whisper_model_name,
+                    device="cuda",
+                    compute_type="float16",
+                )
+                return "cuda", "float16"
+            except RuntimeError:
+                # CUDA libraries missing (cublas64_12.dll, etc.) — fall back
+                device, compute_type = "cpu", "int8"
+
         self._whisper = WhisperModel(
             self.whisper_model_name,
             device=device,
