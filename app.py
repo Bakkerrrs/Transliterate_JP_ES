@@ -83,14 +83,33 @@ STT_METHODS = [
     "OpenAI Whisper API",
 ]
 WHISPER_MODELS = ["large-v3", "medium", "small", "base", "tiny"]
-TRANSLATION_MODELS = [
+
+_DEFAULT_TRANSLATION_MODELS = [
     "gpt-4o-mini",
     "gpt-4o",
     "gpt-4.1-mini",
     "gpt-4.1-nano",
     "gpt-4.1",
+    "gpt-5-mini-2025-08-07",
     "gpt-5.4-2026-03-05",
 ]
+
+
+def _load_translation_models() -> list[str]:
+    """Load translation models from models.txt next to this script, falling back to defaults."""
+    models_path = Path(__file__).parent / "models.txt"
+    if models_path.is_file():
+        models = [
+            line.strip()
+            for line in models_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        if models:
+            return models
+    return list(_DEFAULT_TRANSLATION_MODELS)
+
+
+TRANSLATION_MODELS = _load_translation_models()
 
 
 # ---------------------------------------------------------------------------
