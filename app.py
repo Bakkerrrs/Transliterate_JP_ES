@@ -83,6 +83,12 @@ STT_METHODS = [
 ]
 WHISPER_MODELS = ["large-v3", "medium", "small", "base", "tiny"]
 
+REC_MODES = [
+    "Fijo (4s)",
+    "Fijo (2s)",
+    "VAD (detección de voz)",
+]
+
 _DEFAULT_TRANSLATION_MODELS = [
     "gpt-4o-mini",
     "gpt-4o",
@@ -122,11 +128,22 @@ class AudioCapture:
     ensures only one thread records at a time, but the lock is released
     as soon as the chunk is captured so the next pipe can start
     immediately while the previous one processes.
+
+    Supports three recording modes:
+    - ``fixed``: fixed-length chunks (2s or 4s)
+    - ``vad``: voice-activity detection with adaptive chunk length
     """
 
     SAMPLE_RATE = 16000
     CHANNELS = 1
-    CHUNK_SECONDS = 4
+
+    # VAD parameters
+    _VAD_MICRO_SEC = 0.25       # micro-block size (250ms)
+    _VAD_MIN_SPEECH = 0.8       # min seconds of speech before sending
+    _VAD_MAX_SPEECH = 7.0       # max seconds before force-send
+    _VAD_SILENCE_TIMEOUT = 0.6  # silence after speech to trigger send
+    _VAD_SPEECH_THRESHOLD = 0.005  # RMS threshold for speech detection
+    _VAD_IDLE_TIMEOUT = 4.0     # max seconds of silence before releasing mic
 
     def __init__(self):
         self._running = False
@@ -155,7 +172,6 @@ class AudioCapture:
                 "soundcard no está disponible. Instálalo con: pip install soundcard"
             )
 
-        # Find the speaker, then get its loopback microphone
         if device_name:
             speakers = sc.all_speakers()
             match = [s for s in speakers if s.name == device_name]
@@ -185,17 +201,28 @@ class AudioCapture:
                 pass
             self._recorder = None
 
-    def record_chunk(self, on_start=None):
+    # -- Public recording entry point --------------------------------------
+
+    def record_chunk(self, on_start=None, mode="vad", fixed_seconds=4):
         """Record one chunk (blocking).  Called by pipe worker threads.
 
-        *on_start* is an optional callback invoked with ``(rec_start,)``
-        the instant this thread acquires the mic and begins recording,
-        so the caller can light up its semaphore / start its timer.
+        *on_start*: optional callback ``(rec_start,)`` fired when recording
+        actually begins (after acquiring mic lock).
 
-        Returns ``(wav_bytes, rec_start, rms)`` or ``None`` if stopped
-        or the audio is silent.
+        *mode*: ``"fixed"`` or ``"vad"``.
+
+        *fixed_seconds*: chunk length for fixed mode (2 or 4).
+
+        Returns ``(wav_bytes, rec_start, rms)`` or ``None``.
         """
-        num_frames = self.SAMPLE_RATE * self.CHUNK_SECONDS
+        if mode == "vad":
+            return self._record_vad(on_start)
+        return self._record_fixed(on_start, seconds=fixed_seconds)
+
+    # -- Fixed-length recording --------------------------------------------
+
+    def _record_fixed(self, on_start, seconds):
+        num_frames = self.SAMPLE_RATE * seconds
 
         with self._mic_lock:
             if not self._running:
@@ -215,10 +242,104 @@ class AudioCapture:
         rms = float(np.sqrt(np.mean(audio_float ** 2)))
 
         if rms < 0.001:
-            return None  # silence
+            return None
 
         wav_bytes = self._float_to_wav(audio_float)
         return wav_bytes, rec_start, rms
+
+    # -- VAD recording -----------------------------------------------------
+
+    def _record_vad(self, on_start):
+        """Record using voice-activity detection.
+
+        Listens in 250ms micro-blocks.  Accumulates audio once speech is
+        detected (RMS >= threshold) and sends the chunk when either:
+        - silence is detected for ``_VAD_SILENCE_TIMEOUT`` after speech, or
+        - ``_VAD_MAX_SPEECH`` seconds have been accumulated.
+
+        A small pre-buffer (~0.5s) is kept so the beginning of speech
+        is not clipped.  Returns ``None`` if no speech is detected within
+        ``_VAD_IDLE_TIMEOUT`` seconds (releases the mic for other pipes).
+        """
+        micro_frames = int(self.SAMPLE_RATE * self._VAD_MICRO_SEC)
+        max_pre_blocks = int(0.5 / self._VAD_MICRO_SEC)  # ~0.5s pre-buffer
+
+        with self._mic_lock:
+            if not self._running:
+                return None
+
+            rec_start = time.monotonic()
+            if on_start:
+                on_start(rec_start)
+
+            blocks: list[np.ndarray] = []
+            speech_started = False
+            silence_start: float | None = None
+            total_seconds = 0.0
+            idle_start = time.monotonic()
+
+            while self._running:
+                try:
+                    data = self._recorder.record(numframes=micro_frames)
+                except Exception:
+                    if not self._running:
+                        return None
+                    raise
+
+                audio_float = data[:, 0] if data.ndim > 1 else data
+                rms = float(np.sqrt(np.mean(audio_float ** 2)))
+
+                blocks.append(audio_float)
+                total_seconds += self._VAD_MICRO_SEC
+
+                if not speech_started:
+                    # Waiting for speech
+                    if rms >= self._VAD_SPEECH_THRESHOLD:
+                        speech_started = True
+                        silence_start = None
+                        # Keep pre-buffer, adjust total_seconds
+                        if len(blocks) > max_pre_blocks + 1:
+                            trimmed = blocks[-(max_pre_blocks + 1):]
+                            total_seconds = len(trimmed) * self._VAD_MICRO_SEC
+                            blocks = trimmed
+                    else:
+                        # No speech yet — trim pre-buffer
+                        if len(blocks) > max_pre_blocks:
+                            blocks = blocks[-max_pre_blocks:]
+                            total_seconds = len(blocks) * self._VAD_MICRO_SEC
+                        # Release mic if idle too long
+                        if time.monotonic() - idle_start >= self._VAD_IDLE_TIMEOUT:
+                            return None
+                else:
+                    # Speech in progress
+                    if rms < self._VAD_SPEECH_THRESHOLD:
+                        if silence_start is None:
+                            silence_start = time.monotonic()
+                        elif (time.monotonic() - silence_start
+                              >= self._VAD_SILENCE_TIMEOUT):
+                            # Pause detected after speech
+                            if total_seconds >= self._VAD_MIN_SPEECH:
+                                break
+                    else:
+                        silence_start = None
+
+                    if total_seconds >= self._VAD_MAX_SPEECH:
+                        break
+
+        if not blocks:
+            return None
+
+        audio = np.concatenate(blocks)
+        self._chunk_count += 1
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+
+        if rms < 0.001:
+            return None
+
+        wav_bytes = self._float_to_wav(audio)
+        return wav_bytes, rec_start, rms
+
+    # -- Helpers -----------------------------------------------------------
 
     def _float_to_wav(self, audio: np.ndarray) -> bytes:
         audio_int16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
@@ -455,6 +576,25 @@ class SubtitleApp(ctk.CTk):
         self._trans_combo.set(TRANSLATION_MODELS[0])
         self._trans_combo.grid(row=0, column=3, padx=6, pady=8, sticky="w")
 
+        # Recording mode selector (row 1)
+        ctk.CTkLabel(method_frame, text="Grabación:").grid(
+            row=1, column=0, padx=(12, 6), pady=8, sticky="w"
+        )
+        self._rec_combo = ctk.CTkComboBox(
+            method_frame, values=REC_MODES, state="readonly", width=200,
+        )
+        self._rec_combo.set(REC_MODES[2])  # VAD by default
+        self._rec_combo.grid(row=1, column=1, padx=6, pady=8, sticky="w")
+
+        self._rec_hint = ctk.CTkLabel(
+            method_frame,
+            text="Envía audio al detectar pausas en el habla",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        )
+        self._rec_hint.grid(row=1, column=2, columnspan=2, padx=(12, 12), pady=8, sticky="w")
+        self._rec_combo.configure(command=self._on_rec_mode_changed)
+
         # -- Whisper model selector (row 2, only for local modes) --
         self._whisper_frame = ctk.CTkFrame(self)
         self._whisper_frame.grid(row=2, column=0, padx=12, pady=6, sticky="ew")
@@ -631,6 +771,15 @@ class SubtitleApp(ctk.CTk):
         else:
             self._whisper_hint.configure(text="")
 
+    def _on_rec_mode_changed(self, _value: str = ""):
+        mode = self._rec_combo.get()
+        hints = {
+            "Fijo (4s)": "Chunks fijos de 4 segundos",
+            "Fijo (2s)": "Chunks fijos de 2 segundos (más rápido, menos contexto)",
+            "VAD (detección de voz)": "Envía audio al detectar pausas en el habla",
+        }
+        self._rec_hint.configure(text=hints.get(mode, ""))
+
     # -- Actions -----------------------------------------------------------
 
     def _load_api_key(self):
@@ -697,8 +846,10 @@ class SubtitleApp(ctk.CTk):
             # Disable selectors while running
             self._stt_combo.configure(state="disabled")
             self._whisper_combo.configure(state="disabled")
+            self._rec_combo.configure(state="disabled")
 
             self._is_running = True
+            self._rec_mode = self._rec_combo.get()
             self._stt_ready.clear()
 
             # Open mic (pipe workers will call record_chunk directly)
@@ -711,6 +862,7 @@ class SubtitleApp(ctk.CTk):
                 self._log(f"[DEBUG] Error en audio.start: {type(e).__name__}: {e}")
                 self._stt_combo.configure(state="readonly")
                 self._whisper_combo.configure(state="readonly")
+                self._rec_combo.configure(state="readonly")
                 return
 
             # Load STT in a background thread, then launch pipe workers
@@ -742,6 +894,7 @@ class SubtitleApp(ctk.CTk):
         # Re-enable selectors
         self._stt_combo.configure(state="readonly")
         self._whisper_combo.configure(state="readonly")
+        self._rec_combo.configure(state="readonly")
         # Reset all pipe semaphores and timers
         for pid in range(self.NUM_PIPES):
             self._set_pipe_semaphore(pid, "rec", False)
@@ -788,21 +941,34 @@ class SubtitleApp(ctk.CTk):
         tag = f"P{pipe_id + 1}"
         use_local_whisper = self._service.stt_method != "OpenAI Whisper API"
 
+        # Resolve recording mode once at start
+        rec_mode_str = self._rec_mode
+        if rec_mode_str == "VAD (detección de voz)":
+            rec_mode, rec_fixed = "vad", 4
+        elif rec_mode_str == "Fijo (2s)":
+            rec_mode, rec_fixed = "fixed", 2
+        else:
+            rec_mode, rec_fixed = "fixed", 4
+
         # Wait for STT backend to be ready
         self._stt_ready.wait()
         if not self._is_running:
             return
 
-        self.after(0, self._log, f"[DEBUG] {tag} worker listo")
+        self.after(0, self._log, f"[DEBUG] {tag} worker listo (rec={rec_mode_str})")
 
         while self._is_running:
-            # -- Recording phase (blocks until mic lock acquired + 4s audio) --
+            # -- Recording phase (blocks until mic lock acquired + audio) --
             def on_rec_start(t0, _pid=pipe_id):
                 self.after(0, self._set_pipe_semaphore, _pid, "rec", True)
                 self.after(0, self._start_pipe_timer, _pid, t0)
 
             try:
-                result = self._audio.record_chunk(on_start=on_rec_start)
+                result = self._audio.record_chunk(
+                    on_start=on_rec_start,
+                    mode=rec_mode,
+                    fixed_seconds=rec_fixed,
+                )
             except Exception as e:
                 if not self._is_running:
                     break
