@@ -544,29 +544,37 @@ class SubtitleApp(ctk.CTk):
                 row=0, column=col, padx=2, pady=(4, 0)
             )
 
-        # Per-pipe semaphore rows
-        self._pipe_sem_dots: list[dict[str, ctk.CTkLabel]] = []
+        # Per-pipe semaphore rows (colored square indicators)
+        self._pipe_sem_lights: list[dict[str, ctk.CTkFrame]] = []
         self._pipe_timer_labels: list[ctk.CTkLabel] = []
+
+        _OFF_COLOR = "#555555"  # dark gray = inactive
 
         for i in range(self.NUM_PIPES):
             row = i + 1
             pipe_label = ctk.CTkLabel(
                 pipeline_frame, text=f"P{i + 1}", font=sem_font, width=24
             )
-            pipe_label.grid(row=row, column=0, padx=(8, 2), pady=2)
+            pipe_label.grid(row=row, column=0, padx=(8, 2), pady=3)
 
-            dots: dict[str, ctk.CTkLabel] = {}
+            lights: dict[str, ctk.CTkFrame] = {}
             for col, key in [(1, "rec"), (3, "stt"), (5, "trans")]:
-                dot = ctk.CTkLabel(pipeline_frame, text="⚫", font=dot_font, width=20)
-                dot.grid(row=row, column=col, padx=2, pady=2)
-                dots[key] = dot
+                light = ctk.CTkFrame(
+                    pipeline_frame,
+                    width=16, height=16,
+                    corner_radius=8,
+                    fg_color=_OFF_COLOR,
+                )
+                light.grid(row=row, column=col, padx=4, pady=3)
+                light.grid_propagate(False)
+                lights[key] = light
                 # Arrow separator between stages
                 if col < 5:
                     ctk.CTkLabel(pipeline_frame, text="→", font=sem_font).grid(
-                        row=row, column=col + 1, padx=0, pady=2
+                        row=row, column=col + 1, padx=0, pady=3
                     )
 
-            self._pipe_sem_dots.append(dots)
+            self._pipe_sem_lights.append(lights)
 
             timer_lbl = ctk.CTkLabel(
                 pipeline_frame,
@@ -920,10 +928,10 @@ class SubtitleApp(ctk.CTk):
 
     def _set_pipe_semaphore(self, pipe_id: int, stage: str, active: bool):
         """Update a pipe's semaphore indicator. stage: 'rec', 'stt', 'trans'."""
-        dot = "🟢" if active else "🔴"
-        widget = self._pipe_sem_dots[pipe_id].get(stage)
+        color = "#2ecc71" if active else "#555555"  # bright green / dark gray
+        widget = self._pipe_sem_lights[pipe_id].get(stage)
         if widget:
-            widget.configure(text=dot)
+            widget.configure(fg_color=color)
 
     def _start_pipe_timer(self, pipe_id: int, t0: float):
         """Start the live timer for a specific pipe."""
