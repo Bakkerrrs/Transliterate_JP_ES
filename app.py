@@ -374,20 +374,24 @@ class SubtitleApp(ctk.CTk):
         self._is_running = False
         self._debug_enabled = False
 
-        # Pipeline queues: items are (payload, capture_time) or None (poison pill)
-        self._stt_queue: queue.Queue[tuple[bytes, float] | None] = queue.Queue(maxsize=5)
-        self._translate_queue: queue.Queue[tuple[str, float] | None] = queue.Queue(maxsize=5)
-        self._stt_thread: threading.Thread | None = None
-        self._translate_thread: threading.Thread | None = None
+        # 3 parallel full-chain pipelines (grab → STT → translate)
+        self.NUM_PIPES = 3
+        self._pipe_queues: list[queue.Queue[tuple[bytes, float] | None]] = [
+            queue.Queue(maxsize=1) for _ in range(self.NUM_PIPES)
+        ]
+        self._pipe_threads: list[threading.Thread] = []
+        self._next_pipe = 0  # round-robin counter
 
-        # Pipeline stage flags (for semaphore indicators)
-        self._stage_recording = False
-        self._stage_stt = False
-        self._stage_translating = False
+        # Locks for shared resources
+        self._stt_lock = threading.Lock()       # Whisper model is not thread-safe
+        self._display_lock = threading.Lock()   # serialize subtitle streaming output
 
-        # Live timer: tracks the oldest in-flight chunk timestamp
-        self._timer_start: float | None = None
+        # Per-pipe timer state
+        self._pipe_timer_starts: list[float | None] = [None] * self.NUM_PIPES
         self._timer_after_id: str | None = None
+
+        # Flag: STT backend loaded (pipes wait for this before processing)
+        self._stt_ready = threading.Event()
 
         self._build_ui()
         self._load_api_key()
@@ -525,43 +529,53 @@ class SubtitleApp(ctk.CTk):
         )
         self._subtitle_box.grid(row=1, column=0, padx=8, pady=8, sticky="nsew")
 
-        # -- Pipeline semaphore + timer bar --
+        # -- Pipeline semaphore + timer bar (3 pipes) --
         pipeline_frame = ctk.CTkFrame(self)
         pipeline_frame.grid(row=5, column=0, padx=12, pady=(0, 4), sticky="ew")
-        pipeline_frame.grid_columnconfigure(3, weight=1)
+        pipeline_frame.grid_columnconfigure(7, weight=1)
 
-        sem_font = ctk.CTkFont(size=12)
-        dot_font = ctk.CTkFont(size=14)
+        sem_font = ctk.CTkFont(size=11)
+        dot_font = ctk.CTkFont(size=13)
+        header_font = ctk.CTkFont(size=10, weight="bold")
 
-        # Recording indicator
-        self._sem_rec_dot = ctk.CTkLabel(pipeline_frame, text="⚫", font=dot_font, width=20)
-        self._sem_rec_dot.grid(row=0, column=0, padx=(12, 0), pady=6)
-        ctk.CTkLabel(pipeline_frame, text="Grabación", font=sem_font).grid(
-            row=0, column=1, padx=(2, 16), pady=6
-        )
+        # Column headers
+        for col, label in [(0, ""), (1, "Grab"), (3, "STT"), (5, "Trad"), (7, "Tiempo")]:
+            ctk.CTkLabel(pipeline_frame, text=label, font=header_font).grid(
+                row=0, column=col, padx=2, pady=(4, 0)
+            )
 
-        # STT indicator
-        self._sem_stt_dot = ctk.CTkLabel(pipeline_frame, text="⚫", font=dot_font, width=20)
-        self._sem_stt_dot.grid(row=0, column=2, padx=(0, 0), pady=6)
-        ctk.CTkLabel(pipeline_frame, text="Transliteración", font=sem_font).grid(
-            row=0, column=3, padx=(2, 16), pady=6, sticky="w"
-        )
+        # Per-pipe semaphore rows
+        self._pipe_sem_dots: list[dict[str, ctk.CTkLabel]] = []
+        self._pipe_timer_labels: list[ctk.CTkLabel] = []
 
-        # Translation indicator
-        self._sem_trans_dot = ctk.CTkLabel(pipeline_frame, text="⚫", font=dot_font, width=20)
-        self._sem_trans_dot.grid(row=0, column=4, padx=(0, 0), pady=6)
-        ctk.CTkLabel(pipeline_frame, text="Traducción", font=sem_font).grid(
-            row=0, column=5, padx=(2, 16), pady=6
-        )
+        for i in range(self.NUM_PIPES):
+            row = i + 1
+            pipe_label = ctk.CTkLabel(
+                pipeline_frame, text=f"P{i + 1}", font=sem_font, width=24
+            )
+            pipe_label.grid(row=row, column=0, padx=(8, 2), pady=2)
 
-        # Live timer
-        self._timer_label = ctk.CTkLabel(
-            pipeline_frame,
-            text="⏱ 0,0 s",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            width=100,
-        )
-        self._timer_label.grid(row=0, column=6, padx=(8, 12), pady=6, sticky="e")
+            dots: dict[str, ctk.CTkLabel] = {}
+            for col, key in [(1, "rec"), (3, "stt"), (5, "trans")]:
+                dot = ctk.CTkLabel(pipeline_frame, text="⚫", font=dot_font, width=20)
+                dot.grid(row=row, column=col, padx=2, pady=2)
+                dots[key] = dot
+                # Arrow separator between stages
+                if col < 5:
+                    ctk.CTkLabel(pipeline_frame, text="→", font=sem_font).grid(
+                        row=row, column=col + 1, padx=0, pady=2
+                    )
+
+            self._pipe_sem_dots.append(dots)
+
+            timer_lbl = ctk.CTkLabel(
+                pipeline_frame,
+                text="⏱ --",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                width=80,
+            )
+            timer_lbl.grid(row=row, column=7, padx=(4, 8), pady=2, sticky="e")
+            self._pipe_timer_labels.append(timer_lbl)
 
         # -- Status bar --
         status_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -674,7 +688,7 @@ class SubtitleApp(ctk.CTk):
             self._whisper_combo.configure(state="disabled")
 
             # Clear queues
-            for q in (self._stt_queue, self._translate_queue):
+            for q in self._pipe_queues:
                 while not q.empty():
                     try:
                         q.get_nowait()
@@ -682,12 +696,13 @@ class SubtitleApp(ctk.CTk):
                         break
 
             self._is_running = True
+            self._stt_ready.clear()
+            self._next_pipe = 0
 
-            # Launch pipeline workers (STT worker loads Whisper model before processing)
-            self._stt_thread = threading.Thread(target=self._stt_worker, daemon=True)
-            self._stt_thread.start()
-            self._translate_thread = threading.Thread(target=self._translate_worker, daemon=True)
-            self._translate_thread.start()
+            # Load STT in a background thread, then launch pipe workers
+            self._pipe_threads = []
+            loader = threading.Thread(target=self._load_stt_and_start_pipes, daemon=True)
+            loader.start()
 
             self._log("[DEBUG] Iniciando captura de audio...")
             try:
@@ -704,8 +719,12 @@ class SubtitleApp(ctk.CTk):
             self._start_btn.configure(
                 text="⏹  Detener", fg_color="#c0392b", hover_color="#962d22"
             )
-            self._set_semaphore("rec", True)
-            self._reset_timer()
+            # Reset all pipe semaphores
+            for pid in range(self.NUM_PIPES):
+                self._set_pipe_semaphore(pid, "rec", False)
+                self._set_pipe_semaphore(pid, "stt", False)
+                self._set_pipe_semaphore(pid, "trans", False)
+                self._reset_pipe_timer(pid)
             self._log("[DEBUG] Captura de audio iniciada")
         except Exception as e:
             self._set_status(f"⚠ Error inesperado: {e}")
@@ -714,24 +733,26 @@ class SubtitleApp(ctk.CTk):
     def _stop_capture(self):
         self._audio.stop()
         self._is_running = False
-        # Send poison pills to stop workers
-        self._stt_queue.put(None)
-        self._translate_queue.put(None)
+        self._stt_ready.set()  # unblock any waiting pipes
+        # Send poison pills to stop all pipe workers
+        for q in self._pipe_queues:
+            q.put(None)
         self._start_btn.configure(
             text="▶  Iniciar", fg_color="#2d8a4e", hover_color="#236b3e"
         )
         # Re-enable selectors
         self._stt_combo.configure(state="readonly")
         self._whisper_combo.configure(state="readonly")
-        # Reset semaphores and timer
-        self._set_semaphore("rec", False)
-        self._set_semaphore("stt", False)
-        self._set_semaphore("trans", False)
-        self._reset_timer()
+        # Reset all pipe semaphores and timers
+        for pid in range(self.NUM_PIPES):
+            self._set_pipe_semaphore(pid, "rec", False)
+            self._set_pipe_semaphore(pid, "stt", False)
+            self._set_pipe_semaphore(pid, "trans", False)
+            self._reset_pipe_timer(pid)
         self._set_status("Estado: Detenido")
 
     def _on_audio_chunk(self, wav_bytes: bytes | None, error: str | None, debug_msg: str | None = None):
-        """Called from the audio thread — enqueues audio for the STT worker."""
+        """Called from the audio thread — distributes audio to pipes round-robin."""
         if debug_msg:
             self.after(0, self._log, debug_msg)
             if wav_bytes is None and error is None:
@@ -743,17 +764,22 @@ class SubtitleApp(ctk.CTk):
             self.after(0, self._stop_capture)
             return
 
-        # Enqueue with capture timestamp; drop if queue is full
+        # Round-robin: assign chunk to next pipe
         capture_time = time.monotonic()
+        pipe_id = self._next_pipe
         try:
-            self._stt_queue.put_nowait((wav_bytes, capture_time))
+            self._pipe_queues[pipe_id].put_nowait((wav_bytes, capture_time))
+            self.after(0, self._set_pipe_semaphore, pipe_id, "rec", True)
+            self.after(0, self._start_pipe_timer, pipe_id, capture_time)
+            self._next_pipe = (self._next_pipe + 1) % self.NUM_PIPES
         except queue.Full:
-            self.after(0, self._log, "[DEBUG] STT queue llena, chunk descartado")
+            self.after(0, self._log,
+                       f"[DEBUG] Pipe {pipe_id + 1} ocupado, chunk descartado")
 
     # -- Pipeline workers --------------------------------------------------
 
-    def _stt_worker(self):
-        """Thread: loads STT backend, then transcribes audio chunks."""
+    def _load_stt_and_start_pipes(self):
+        """Thread: loads STT backend, then launches pipe workers."""
         stt_method = self._service.stt_method
         self.after(0, self._set_status, f"⏳ Cargando STT ({stt_method})...")
         self.after(0, self._log, f"[DEBUG] Cargando STT: {stt_method}...")
@@ -768,10 +794,28 @@ class SubtitleApp(ctk.CTk):
 
         self.after(0, self._log, f"[DEBUG] STT listo: {status}")
         self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
+        self._stt_ready.set()
+
+        # Launch 3 pipe workers
+        for pid in range(self.NUM_PIPES):
+            t = threading.Thread(target=self._pipe_worker, args=(pid,), daemon=True)
+            t.start()
+            self._pipe_threads.append(t)
+
+    def _pipe_worker(self, pipe_id: int):
+        """Thread: full pipeline worker for one pipe (grab → STT → translate)."""
+        tag = f"P{pipe_id + 1}"
+
+        # Wait for STT backend to be ready
+        self._stt_ready.wait()
+        if not self._is_running:
+            return
+
+        self.after(0, self._log, f"[DEBUG] {tag} worker listo")
 
         while self._is_running:
             try:
-                item = self._stt_queue.get(timeout=1)
+                item = self._pipe_queues[pipe_id].get(timeout=1)
             except queue.Empty:
                 continue
             if item is None:
@@ -781,79 +825,64 @@ class SubtitleApp(ctk.CTk):
 
             self._service.update_translation_model(self._trans_combo.get())
 
-            self.after(0, self._set_semaphore, "stt", True)
-            self.after(0, self._start_timer, t0)
-            self.after(0, self._set_status, "📝 Transcribiendo...")
+            # -- STT phase (serialized via lock for local Whisper) --
+            self.after(0, self._set_pipe_semaphore, pipe_id, "rec", False)
+            self.after(0, self._set_pipe_semaphore, pipe_id, "stt", True)
+            self.after(0, self._set_status, f"📝 {tag} Transcribiendo...")
             self.after(0, self._log,
-                       f"[DEBUG] Transcribiendo audio ({len(wav_bytes)} bytes)...")
+                       f"[DEBUG] {tag} Transcribiendo ({len(wav_bytes)} bytes)...")
 
             try:
-                jp_text = self._service.transcribe(wav_bytes)
+                with self._stt_lock:
+                    jp_text = self._service.transcribe(wav_bytes)
             except Exception as e:
-                self.after(0, self._set_semaphore, "stt", False)
-                self.after(0, self._log, f"[ERROR] STT: {type(e).__name__}: {e}")
+                self.after(0, self._set_pipe_semaphore, pipe_id, "stt", False)
+                self.after(0, self._stop_pipe_timer, pipe_id)
+                self.after(0, self._log, f"[ERROR] {tag} STT: {type(e).__name__}: {e}")
                 continue
 
-            self.after(0, self._set_semaphore, "stt", False)
-            self.after(0, self._log, f"[DEBUG] STT resultado: '{jp_text}'")
+            self.after(0, self._set_pipe_semaphore, pipe_id, "stt", False)
+            self.after(0, self._log, f"[DEBUG] {tag} STT: '{jp_text}'")
 
             if not jp_text:
-                self.after(0, self._stop_timer)
+                self.after(0, self._stop_pipe_timer, pipe_id)
                 self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
                 continue
 
-            # Enqueue for translation, carrying the original capture timestamp
-            try:
-                self._translate_queue.put_nowait((jp_text, t0))
-            except queue.Full:
-                self.after(0, self._log, "[DEBUG] Cola traducción llena, texto descartado")
+            # -- Translation phase (display serialized via lock) --
+            self.after(0, self._set_pipe_semaphore, pipe_id, "trans", True)
+            self.after(0, self._set_status, f"🌐 {tag} Traduciendo...")
 
-        self.after(0, self._log, "[DEBUG] STT worker finalizado")
+            with self._display_lock:
+                self.after(0, self._begin_subtitle, jp_text, tag)
 
-    def _translate_worker(self):
-        """Thread: streams GPT translation to the subtitle box."""
-        while self._is_running:
-            try:
-                item = self._translate_queue.get(timeout=1)
-            except queue.Empty:
-                continue
-            if item is None:
-                break
+                try:
+                    for token in self._service.translate_stream(jp_text):
+                        self.after(0, self._stream_token, token)
+                except Exception as e:
+                    self.after(0, self._set_pipe_semaphore, pipe_id, "trans", False)
+                    self.after(0, self._stop_pipe_timer, pipe_id)
+                    self.after(0, self._log,
+                               f"[ERROR] {tag} Traducción: {type(e).__name__}: {e}")
+                    self.after(0, self._end_subtitle, None)
+                    continue
 
-            jp_text, t0 = item
+                elapsed = time.monotonic() - t0
+                self.after(0, self._end_subtitle, elapsed)
 
-            if not self._service:
-                continue
-
-            self.after(0, self._set_semaphore, "trans", True)
-            self.after(0, self._start_timer, t0)
-            self.after(0, self._set_status, "🌐 Traduciendo...")
-            self.after(0, self._begin_subtitle, jp_text)
-
-            try:
-                for token in self._service.translate_stream(jp_text):
-                    self.after(0, self._stream_token, token)
-            except Exception as e:
-                self.after(0, self._set_semaphore, "trans", False)
-                self.after(0, self._stop_timer)
-                self.after(0, self._log, f"[ERROR] Traducción: {type(e).__name__}: {e}")
-                self.after(0, self._end_subtitle, None)
-                continue
-
-            elapsed = time.monotonic() - t0
-            self.after(0, self._set_semaphore, "trans", False)
-            self.after(0, self._stop_timer)
-            self.after(0, self._end_subtitle, elapsed)
+            self.after(0, self._set_pipe_semaphore, pipe_id, "trans", False)
+            self.after(0, self._stop_pipe_timer, pipe_id)
             self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
 
-        self.after(0, self._log, "[DEBUG] Translate worker finalizado")
+        self.after(0, self._log, f"[DEBUG] {tag} worker finalizado")
 
     # -- Subtitle display helpers ------------------------------------------
 
-    def _begin_subtitle(self, jp_text: str):
+    def _begin_subtitle(self, jp_text: str, tag: str = ""):
         """Insert the JP line and start the ES line for streaming."""
+        prefix = f"[{tag}] " if tag else ""
         self._subtitle_box.configure(state="normal")
-        self._subtitle_box.insert("end", f"🇯🇵  {jp_text}\n🇪🇸  ")
+        self._subtitle_box.insert("end", f"{prefix}🇯🇵  {jp_text}\n{' ' * len(prefix)}🇪🇸  ")
         self._subtitle_box.see("end")
         self._subtitle_box.configure(state="disabled")
 
@@ -887,44 +916,50 @@ class SubtitleApp(ctk.CTk):
     def _set_status(self, text: str):
         self._status_label.configure(text=text)
 
-    # -- Semaphore & timer helpers -----------------------------------------
+    # -- Per-pipe semaphore & timer helpers --------------------------------
 
-    def _set_semaphore(self, stage: str, active: bool):
-        """Update a pipeline semaphore indicator. stage: 'rec', 'stt', 'trans'."""
+    def _set_pipe_semaphore(self, pipe_id: int, stage: str, active: bool):
+        """Update a pipe's semaphore indicator. stage: 'rec', 'stt', 'trans'."""
         dot = "🟢" if active else "🔴"
-        widget_map = {
-            "rec": "_sem_rec_dot",
-            "stt": "_sem_stt_dot",
-            "trans": "_sem_trans_dot",
-        }
-        widget = getattr(self, widget_map[stage], None)
+        widget = self._pipe_sem_dots[pipe_id].get(stage)
         if widget:
             widget.configure(text=dot)
 
-    def _start_timer(self, t0: float):
-        """Start (or restart) the live timer from timestamp t0."""
-        self._timer_start = t0
+    def _start_pipe_timer(self, pipe_id: int, t0: float):
+        """Start the live timer for a specific pipe."""
+        self._pipe_timer_starts[pipe_id] = t0
         if self._timer_after_id is None:
-            self._tick_timer()
+            self._tick_timers()
 
-    def _stop_timer(self):
-        """Stop the live timer and show final elapsed time."""
-        if self._timer_start is not None:
-            elapsed = time.monotonic() - self._timer_start
-            self._timer_label.configure(text=f"⏱ {elapsed:.1f} s".replace(".", ","))
-        self._timer_start = None
+    def _stop_pipe_timer(self, pipe_id: int):
+        """Stop a pipe's timer and show final elapsed time."""
+        t0 = self._pipe_timer_starts[pipe_id]
+        if t0 is not None:
+            elapsed = time.monotonic() - t0
+            self._pipe_timer_labels[pipe_id].configure(
+                text=f"⏱ {elapsed:.1f} s".replace(".", ",")
+            )
+        self._pipe_timer_starts[pipe_id] = None
 
-    def _reset_timer(self):
-        """Reset the timer display."""
-        self._timer_start = None
-        self._timer_label.configure(text="⏱ 0,0 s")
+    def _reset_pipe_timer(self, pipe_id: int):
+        """Reset a pipe's timer display."""
+        self._pipe_timer_starts[pipe_id] = None
+        self._pipe_timer_labels[pipe_id].configure(text="⏱ --")
 
-    def _tick_timer(self):
-        """Periodic callback to update the live timer display."""
-        if self._timer_start is not None:
-            elapsed = time.monotonic() - self._timer_start
-            self._timer_label.configure(text=f"⏱ {elapsed:.1f} s".replace(".", ","))
-            self._timer_after_id = self.after(100, self._tick_timer)
+    def _tick_timers(self):
+        """Periodic callback to update all active pipe timers."""
+        any_active = False
+        now = time.monotonic()
+        for i in range(self.NUM_PIPES):
+            t0 = self._pipe_timer_starts[i]
+            if t0 is not None:
+                elapsed = now - t0
+                self._pipe_timer_labels[i].configure(
+                    text=f"⏱ {elapsed:.1f} s".replace(".", ",")
+                )
+                any_active = True
+        if any_active:
+            self._timer_after_id = self.after(100, self._tick_timers)
         else:
             self._timer_after_id = None
 
@@ -932,13 +967,14 @@ class SubtitleApp(ctk.CTk):
 
     def destroy(self):
         self._is_running = False
-        self._timer_start = None
+        self._stt_ready.set()  # unblock waiting pipes
+        self._pipe_timer_starts = [None] * self.NUM_PIPES
         if self._timer_after_id is not None:
             self.after_cancel(self._timer_after_id)
             self._timer_after_id = None
         self._audio.stop()
-        self._stt_queue.put(None)
-        self._translate_queue.put(None)
+        for q in self._pipe_queues:
+            q.put(None)
         super().destroy()
 
 
