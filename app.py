@@ -83,7 +83,14 @@ STT_METHODS = [
     "OpenAI Whisper API",
 ]
 WHISPER_MODELS = ["large-v3", "medium", "small", "base", "tiny"]
-TRANSLATION_MODELS = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1-nano"]
+TRANSLATION_MODELS = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4.1",
+    "gpt-5.4-2026-03-05",
+]
 
 
 # ---------------------------------------------------------------------------
