@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import io
 import os
-import queue
 import threading
 import time
 import warnings
@@ -117,7 +116,13 @@ TRANSLATION_MODELS = _load_translation_models()
 # ---------------------------------------------------------------------------
 
 class AudioCapture:
-    """Captures system audio using loopback recording."""
+    """Captures system audio using loopback recording.
+
+    Pipe workers call ``record_chunk()`` directly.  An internal lock
+    ensures only one thread records at a time, but the lock is released
+    as soon as the chunk is captured so the next pipe can start
+    immediately while the previous one processes.
+    """
 
     SAMPLE_RATE = 16000
     CHANNELS = 1
@@ -125,9 +130,10 @@ class AudioCapture:
 
     def __init__(self):
         self._running = False
-        self._thread: threading.Thread | None = None
-        self._on_chunk = None
         self._loopback = None
+        self._recorder = None
+        self._mic_lock = threading.Lock()
+        self._chunk_count = 0
 
     @staticmethod
     def list_loopback_devices() -> list[str]:
@@ -139,12 +145,10 @@ class AudioCapture:
         except Exception:
             return []
 
-    def start(self, on_chunk, device_name: str | None = None):
-        """Start capturing. *on_chunk* receives a WAV bytes buffer each cycle."""
+    def start(self, device_name: str | None = None):
+        """Open the loopback mic so pipe workers can call record_chunk()."""
         if self._running:
             return
-        self._on_chunk = on_chunk
-        self._running = True
 
         if sc is None:
             raise RuntimeError(
@@ -159,60 +163,62 @@ class AudioCapture:
         else:
             speaker = sc.default_speaker()
 
-        # Get loopback mic for the selected speaker
         self._loopback = sc.get_microphone(
             speaker.id, include_loopback=True
         )
 
-        self._thread = threading.Thread(target=self._record_loop, daemon=True)
-        self._thread.start()
+        self._recorder = self._loopback.recorder(
+            samplerate=self.SAMPLE_RATE,
+            channels=self.CHANNELS,
+            blocksize=1024,
+        )
+        self._recorder.__enter__()
+        self._running = True
+        self._chunk_count = 0
 
     def stop(self):
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
-            self._thread = None
+        if self._recorder:
+            try:
+                self._recorder.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._recorder = None
 
-    def _record_loop(self):
+    def record_chunk(self, on_start=None):
+        """Record one chunk (blocking).  Called by pipe worker threads.
+
+        *on_start* is an optional callback invoked with ``(rec_start,)``
+        the instant this thread acquires the mic and begins recording,
+        so the caller can light up its semaphore / start its timer.
+
+        Returns ``(wav_bytes, rec_start, rms)`` or ``None`` if stopped
+        or the audio is silent.
+        """
         num_frames = self.SAMPLE_RATE * self.CHUNK_SECONDS
-        if self._on_chunk:
-            self._on_chunk(None, None, "[DEBUG] _record_loop iniciado")
-        try:
-            mic = self._loopback.recorder(
-                samplerate=self.SAMPLE_RATE,
-                channels=self.CHANNELS,
-                blocksize=1024,
-            )
-        except Exception as e:
-            if self._on_chunk:
-                self._on_chunk(None, f"Error creando recorder: {type(e).__name__}: {e}")
-            return
 
-        if self._on_chunk:
-            self._on_chunk(None, None, "[DEBUG] Recorder creado, grabando...")
+        with self._mic_lock:
+            if not self._running:
+                return None
+            rec_start = time.monotonic()
+            if on_start:
+                on_start(rec_start)
+            try:
+                data = self._recorder.record(numframes=num_frames)
+            except Exception:
+                if not self._running:
+                    return None
+                raise
 
-        with mic:
-            chunk_count = 0
-            while self._running:
-                try:
-                    rec_start = time.monotonic()
-                    data = mic.record(numframes=num_frames)
-                    chunk_count += 1
-                    audio_float = data[:, 0] if data.ndim > 1 else data
-                    wav_bytes = self._float_to_wav(audio_float)
+        self._chunk_count += 1
+        audio_float = data[:, 0] if data.ndim > 1 else data
+        rms = float(np.sqrt(np.mean(audio_float ** 2)))
 
-                    rms = np.sqrt(np.mean(audio_float ** 2))
-                    if self._on_chunk:
-                        self._on_chunk(None, None, f"[DEBUG] Chunk #{chunk_count} - RMS: {rms:.6f}")
-                    if rms < 0.001:
-                        continue
+        if rms < 0.001:
+            return None  # silence
 
-                    if self._on_chunk:
-                        self._on_chunk(wav_bytes, None, rec_start=rec_start)
-                except Exception as e:
-                    if self._on_chunk and self._running:
-                        self._on_chunk(None, f"Error en record: {type(e).__name__}: {e}")
-                    break
+        wav_bytes = self._float_to_wav(audio_float)
+        return wav_bytes, rec_start, rms
 
     def _float_to_wav(self, audio: np.ndarray) -> bytes:
         audio_int16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
@@ -375,17 +381,13 @@ class SubtitleApp(ctk.CTk):
         self._is_running = False
         self._debug_enabled = False
 
-        # 3 parallel full-chain pipelines (grab → STT → translate)
+        # 3 parallel full-chain pipelines (rec → STT → translate)
         self.NUM_PIPES = 3
-        self._pipe_queues: list[queue.Queue[tuple[bytes, float] | None]] = [
-            queue.Queue(maxsize=1) for _ in range(self.NUM_PIPES)
-        ]
         self._pipe_threads: list[threading.Thread] = []
-        self._next_pipe = 0  # round-robin counter
 
         # Locks for shared resources
         self._stt_lock = threading.Lock()       # Whisper model is not thread-safe
-        self._display_lock = threading.Lock()   # serialize subtitle streaming output
+        self._display_lock = threading.Lock()   # serialize subtitle display output
 
         # Per-pipe timer state
         self._pipe_timer_starts: list[float | None] = [None] * self.NUM_PIPES
@@ -696,35 +698,25 @@ class SubtitleApp(ctk.CTk):
             self._stt_combo.configure(state="disabled")
             self._whisper_combo.configure(state="disabled")
 
-            # Clear queues
-            for q in self._pipe_queues:
-                while not q.empty():
-                    try:
-                        q.get_nowait()
-                    except queue.Empty:
-                        break
-
             self._is_running = True
             self._stt_ready.clear()
-            self._next_pipe = 0
 
-            # Load STT in a background thread, then launch pipe workers
-            self._pipe_threads = []
-            loader = threading.Thread(target=self._load_stt_and_start_pipes, daemon=True)
-            loader.start()
-
-            self._log("[DEBUG] Iniciando captura de audio...")
+            # Open mic (pipe workers will call record_chunk directly)
+            self._log("[DEBUG] Abriendo dispositivo de audio...")
             try:
-                self._audio.start(self._on_audio_chunk, device_name)
+                self._audio.start(device_name)
             except Exception as e:
                 self._is_running = False
-                for q in self._pipe_queues:
-                    q.put(None)
                 self._set_status(f"⚠ Error de audio: {e}")
                 self._log(f"[DEBUG] Error en audio.start: {type(e).__name__}: {e}")
                 self._stt_combo.configure(state="readonly")
                 self._whisper_combo.configure(state="readonly")
                 return
+
+            # Load STT in a background thread, then launch pipe workers
+            self._pipe_threads = []
+            loader = threading.Thread(target=self._load_stt_and_start_pipes, daemon=True)
+            loader.start()
 
             self._start_btn.configure(
                 text="⏹  Detener", fg_color="#c0392b", hover_color="#962d22"
@@ -741,12 +733,9 @@ class SubtitleApp(ctk.CTk):
             self._log(f"[DEBUG] Excepción no controlada: {type(e).__name__}: {e}")
 
     def _stop_capture(self):
-        self._audio.stop()
         self._is_running = False
         self._stt_ready.set()  # unblock any waiting pipes
-        # Send poison pills to stop all pipe workers
-        for q in self._pipe_queues:
-            q.put(None)
+        self._audio.stop()     # releases mic lock waiters
         self._start_btn.configure(
             text="▶  Iniciar", fg_color="#2d8a4e", hover_color="#236b3e"
         )
@@ -760,34 +749,6 @@ class SubtitleApp(ctk.CTk):
             self._set_pipe_semaphore(pid, "trans", False)
             self._reset_pipe_timer(pid)
         self._set_status("Estado: Detenido")
-
-    def _on_audio_chunk(self, wav_bytes: bytes | None, error: str | None,
-                        debug_msg: str | None = None, rec_start: float | None = None):
-        """Called from the audio thread — distributes audio to pipes round-robin."""
-        if debug_msg:
-            self.after(0, self._log, debug_msg)
-            if wav_bytes is None and error is None:
-                return
-
-        if error:
-            self.after(0, self._set_status, f"⚠ Audio error: {error}")
-            self.after(0, self._log, f"[ERROR] {error}")
-            self.after(0, self._stop_capture)
-            return
-
-        # Use recording start time (before mic.record) for accurate timing
-        t0 = rec_start if rec_start is not None else time.monotonic()
-
-        # Round-robin: assign chunk to next pipe
-        pipe_id = self._next_pipe
-        try:
-            self._pipe_queues[pipe_id].put_nowait((wav_bytes, t0))
-            self.after(0, self._set_pipe_semaphore, pipe_id, "rec", True)
-            self.after(0, self._start_pipe_timer, pipe_id, t0)
-            self._next_pipe = (self._next_pipe + 1) % self.NUM_PIPES
-        except queue.Full:
-            self.after(0, self._log,
-                       f"[DEBUG] Pipe {pipe_id + 1} ocupado, chunk descartado")
 
     # -- Pipeline workers --------------------------------------------------
 
@@ -816,7 +777,14 @@ class SubtitleApp(ctk.CTk):
             self._pipe_threads.append(t)
 
     def _pipe_worker(self, pipe_id: int):
-        """Thread: full pipeline worker for one pipe (grab → STT → translate)."""
+        """Thread: full pipeline — record → STT → translate → display.
+
+        Each pipe records its own audio chunk by calling
+        ``self._audio.record_chunk()``.  An internal mic lock inside
+        AudioCapture ensures only one pipe records at a time, but the
+        lock is released the instant recording finishes so the next
+        pipe can start recording while this one does STT / translation.
+        """
         tag = f"P{pipe_id + 1}"
         use_local_whisper = self._service.stt_method != "OpenAI Whisper API"
 
@@ -828,26 +796,39 @@ class SubtitleApp(ctk.CTk):
         self.after(0, self._log, f"[DEBUG] {tag} worker listo")
 
         while self._is_running:
+            # -- Recording phase (blocks until mic lock acquired + 4s audio) --
+            def on_rec_start(t0, _pid=pipe_id):
+                self.after(0, self._set_pipe_semaphore, _pid, "rec", True)
+                self.after(0, self._start_pipe_timer, _pid, t0)
+
             try:
-                item = self._pipe_queues[pipe_id].get(timeout=1)
-            except queue.Empty:
-                continue
-            if item is None:
+                result = self._audio.record_chunk(on_start=on_rec_start)
+            except Exception as e:
+                if not self._is_running:
+                    break
+                self.after(0, self._log,
+                           f"[ERROR] {tag} Grabación: {type(e).__name__}: {e}")
+                self.after(0, self._stop_pipe_timer, pipe_id)
                 break
 
-            wav_bytes, t0 = item
+            self.after(0, self._set_pipe_semaphore, pipe_id, "rec", False)
+
+            if result is None:
+                self.after(0, self._stop_pipe_timer, pipe_id)
+                continue  # silence or stopped
+
+            wav_bytes, t0, rms = result
+            self.after(0, self._log,
+                       f"[DEBUG] {tag} Chunk grabado - RMS: {rms:.6f} "
+                       f"({len(wav_bytes)} bytes)")
 
             self._service.update_translation_model(self._trans_combo.get())
 
-            # -- STT phase --
-            self.after(0, self._set_pipe_semaphore, pipe_id, "rec", False)
+            # -- STT phase (runs in parallel with next pipe's recording) --
             self.after(0, self._set_pipe_semaphore, pipe_id, "stt", True)
             self.after(0, self._set_status, f"📝 {tag} Transcribiendo...")
-            self.after(0, self._log,
-                       f"[DEBUG] {tag} Transcribiendo ({len(wav_bytes)} bytes)...")
 
             try:
-                # Lock only needed for local Whisper (not thread-safe)
                 if use_local_whisper:
                     with self._stt_lock:
                         jp_text = self._service.transcribe(wav_bytes)
@@ -864,7 +845,6 @@ class SubtitleApp(ctk.CTk):
 
             if not jp_text:
                 self.after(0, self._stop_pipe_timer, pipe_id)
-                self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
                 continue
 
             # -- Translation phase (parallel: no lock during API call) --
@@ -892,7 +872,6 @@ class SubtitleApp(ctk.CTk):
 
             self.after(0, self._set_pipe_semaphore, pipe_id, "trans", False)
             self.after(0, self._stop_pipe_timer, pipe_id)
-            self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
 
         self.after(0, self._log, f"[DEBUG] {tag} worker finalizado")
 
@@ -981,8 +960,6 @@ class SubtitleApp(ctk.CTk):
             self.after_cancel(self._timer_after_id)
             self._timer_after_id = None
         self._audio.stop()
-        for q in self._pipe_queues:
-            q.put(None)
         super().destroy()
 
 
