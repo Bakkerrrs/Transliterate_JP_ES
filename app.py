@@ -2,7 +2,8 @@
 Transliterate JP→ES: Real-time Japanese audio to Spanish subtitle translator.
 
 Captures system audio (loopback), transcribes Japanese speech using local
-faster-whisper, and translates to Spanish using OpenAI GPT with streaming output.
+faster-whisper or OpenAI Whisper API, and translates to Spanish using
+OpenAI GPT with streaming output.
 """
 
 from __future__ import annotations
@@ -70,6 +71,19 @@ def _detect_device() -> tuple[str, str]:
     except Exception:
         pass
     return "cpu", "int8"
+
+
+# ---------------------------------------------------------------------------
+# STT / Translation method constants
+# ---------------------------------------------------------------------------
+
+STT_METHODS = [
+    "Whisper Local (GPU)",
+    "Whisper Local (CPU)",
+    "OpenAI Whisper API",
+]
+WHISPER_MODELS = ["large-v3", "medium", "small", "base", "tiny"]
+TRANSLATION_MODELS = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1-nano"]
 
 
 # ---------------------------------------------------------------------------
@@ -186,65 +200,85 @@ class AudioCapture:
 
 
 # ---------------------------------------------------------------------------
-# Services: local Whisper STT + OpenAI GPT streaming translation
+# Services: STT + OpenAI GPT streaming translation
 # ---------------------------------------------------------------------------
 
-WHISPER_MODELS = ["large-v3", "medium", "small", "base", "tiny"]
-TRANSLATION_MODELS = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1-nano"]
-
-
 class TranscriptionService:
-    """Local faster-whisper STT + OpenAI GPT streaming translation."""
+    """Handles STT (local or API) + OpenAI GPT streaming translation."""
 
-    def __init__(self, api_key: str, whisper_model: str, translation_model: str):
+    def __init__(self, api_key: str, whisper_model: str, translation_model: str,
+                 stt_method: str = "Whisper Local (GPU)"):
         self.client = OpenAI(api_key=api_key)
         self.whisper_model_name = whisper_model
         self.translation_model = translation_model
+        self.stt_method = stt_method
         self._context: deque[str] = deque(maxlen=5)
         self._whisper: WhisperModel | None = None
 
-    def load_whisper(self) -> tuple[str, str]:
-        """Load the faster-whisper model. Returns (device, compute_type).
+    def load_whisper(self) -> str:
+        """Load the STT backend. Returns a status string describing what was loaded."""
+        if self.stt_method == "OpenAI Whisper API":
+            return "OpenAI Whisper API (nube)"
 
-        Tries CUDA first; if GPU libraries (cuBLAS, etc.) are missing or
-        fail to load, falls back automatically to CPU.
-        """
+        # Local faster-whisper
         if not _fw_available:
             raise RuntimeError(
                 "faster-whisper no está instalado. "
                 "Instálalo con: pip install faster-whisper"
             )
-        device, compute_type = _detect_device()
 
-        if device == "cuda":
-            try:
-                self._whisper = WhisperModel(
-                    self.whisper_model_name,
-                    device="cuda",
-                    compute_type="float16",
-                )
-                return "cuda", "float16"
-            except RuntimeError:
-                # CUDA libraries missing (cublas64_12.dll, etc.) — fall back
-                device, compute_type = "cpu", "int8"
+        if self.stt_method == "Whisper Local (GPU)":
+            device, compute_type = _detect_device()
+            if device == "cuda":
+                try:
+                    self._whisper = WhisperModel(
+                        self.whisper_model_name,
+                        device="cuda",
+                        compute_type="float16",
+                    )
+                    return f"faster-whisper {self.whisper_model_name} (cuda, float16)"
+                except RuntimeError:
+                    pass
+            # GPU requested but unavailable — fail explicitly so user knows
+            raise RuntimeError(
+                "No se pudo inicializar CUDA. Verifica que tienes GPU compatible "
+                "y las librerías CUDA instaladas (pip install nvidia-cublas-cu12 "
+                "nvidia-cudnn-cu12). O selecciona 'Whisper Local (CPU)'."
+            )
 
+        # CPU mode
         self._whisper = WhisperModel(
             self.whisper_model_name,
-            device=device,
-            compute_type=compute_type,
+            device="cpu",
+            compute_type="int8",
         )
-        return device, compute_type
+        return f"faster-whisper {self.whisper_model_name} (cpu, int8)"
 
     def update_translation_model(self, translation_model: str):
         self.translation_model = translation_model
 
     def transcribe(self, wav_bytes: bytes) -> str:
+        if self.stt_method == "OpenAI Whisper API":
+            return self._transcribe_api(wav_bytes)
+        return self._transcribe_local(wav_bytes)
+
+    def _transcribe_local(self, wav_bytes: bytes) -> str:
         segments, _info = self._whisper.transcribe(
             io.BytesIO(wav_bytes),
             language="ja",
             beam_size=5,
         )
         return "".join(s.text for s in segments).strip()
+
+    def _transcribe_api(self, wav_bytes: bytes) -> str:
+        wav_file = io.BytesIO(wav_bytes)
+        wav_file.name = "audio.wav"
+        response = self.client.audio.transcriptions.create(
+            model="whisper-1",
+            file=wav_file,
+            language="ja",
+        )
+        return response.text.strip()
 
     def translate_stream(self, japanese_text: str):
         """Yield translation tokens as they stream from GPT."""
@@ -327,19 +361,18 @@ class SubtitleApp(ctk.CTk):
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(4, weight=1)
 
-        # -- Config frame --
+        # -- Config frame (API Key) --
         config_frame = ctk.CTkFrame(self)
         config_frame.grid(row=0, column=0, padx=12, pady=(12, 6), sticky="ew")
         config_frame.grid_columnconfigure(1, weight=1)
 
-        # API Key
         ctk.CTkLabel(config_frame, text="API Key:").grid(
             row=0, column=0, padx=(12, 6), pady=8, sticky="w"
         )
         self._api_key_entry = ctk.CTkEntry(
-            config_frame, placeholder_text="sk-... (OpenAI para traducción)", show="•", width=350
+            config_frame, placeholder_text="sk-... (OpenAI)", show="•", width=350
         )
         self._api_key_entry.grid(row=0, column=1, padx=6, pady=8, sticky="ew")
 
@@ -353,35 +386,59 @@ class SubtitleApp(ctk.CTk):
         )
         self._show_key_btn.grid(row=0, column=2, padx=(0, 12), pady=8)
 
-        # -- Model selectors frame --
-        model_frame = ctk.CTkFrame(self)
-        model_frame.grid(row=1, column=0, padx=12, pady=6, sticky="ew")
-        model_frame.grid_columnconfigure(1, weight=1)
-        model_frame.grid_columnconfigure(3, weight=1)
+        # -- STT + Translation method frame --
+        method_frame = ctk.CTkFrame(self)
+        method_frame.grid(row=1, column=0, padx=12, pady=6, sticky="ew")
+        method_frame.grid_columnconfigure(1, weight=1)
+        method_frame.grid_columnconfigure(3, weight=1)
 
-        # Whisper model (local)
-        ctk.CTkLabel(model_frame, text="Whisper (local):").grid(
+        # STT method selector
+        ctk.CTkLabel(method_frame, text="Transcripción:").grid(
             row=0, column=0, padx=(12, 6), pady=8, sticky="w"
         )
-        self._whisper_combo = ctk.CTkComboBox(
-            model_frame, values=WHISPER_MODELS, state="readonly", width=180
+        self._stt_combo = ctk.CTkComboBox(
+            method_frame, values=STT_METHODS, state="readonly", width=200,
+            command=self._on_stt_method_changed,
         )
-        self._whisper_combo.set(WHISPER_MODELS[0])
-        self._whisper_combo.grid(row=0, column=1, padx=6, pady=8, sticky="w")
+        self._stt_combo.set(STT_METHODS[0])
+        self._stt_combo.grid(row=0, column=1, padx=6, pady=8, sticky="w")
 
         # Translation model (GPT)
-        ctk.CTkLabel(model_frame, text="Traducción (GPT):").grid(
+        ctk.CTkLabel(method_frame, text="Traducción (GPT):").grid(
             row=0, column=2, padx=(24, 6), pady=8, sticky="w"
         )
         self._trans_combo = ctk.CTkComboBox(
-            model_frame, values=TRANSLATION_MODELS, state="readonly", width=180
+            method_frame, values=TRANSLATION_MODELS, state="readonly", width=180
         )
         self._trans_combo.set(TRANSLATION_MODELS[0])
         self._trans_combo.grid(row=0, column=3, padx=6, pady=8, sticky="w")
 
+        # -- Whisper model selector (row 2, only for local modes) --
+        self._whisper_frame = ctk.CTkFrame(self)
+        self._whisper_frame.grid(row=2, column=0, padx=12, pady=6, sticky="ew")
+        self._whisper_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(self._whisper_frame, text="Modelo Whisper:").grid(
+            row=0, column=0, padx=(12, 6), pady=8, sticky="w"
+        )
+        self._whisper_combo = ctk.CTkComboBox(
+            self._whisper_frame, values=WHISPER_MODELS, state="readonly", width=180
+        )
+        self._whisper_combo.set(WHISPER_MODELS[0])
+        self._whisper_combo.grid(row=0, column=1, padx=6, pady=8, sticky="w")
+
+        self._whisper_hint = ctk.CTkLabel(
+            self._whisper_frame,
+            text="",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        )
+        self._whisper_hint.grid(row=0, column=2, padx=(12, 12), pady=8, sticky="w")
+        self._update_whisper_hint()
+
         # -- Audio device + controls --
         ctrl_frame = ctk.CTkFrame(self)
-        ctrl_frame.grid(row=2, column=0, padx=12, pady=6, sticky="ew")
+        ctrl_frame.grid(row=3, column=0, padx=12, pady=6, sticky="ew")
         ctrl_frame.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(ctrl_frame, text="Dispositivo:").grid(
@@ -415,7 +472,7 @@ class SubtitleApp(ctk.CTk):
 
         # -- Subtitle display area --
         subtitle_frame = ctk.CTkFrame(self)
-        subtitle_frame.grid(row=3, column=0, padx=12, pady=(6, 12), sticky="nsew")
+        subtitle_frame.grid(row=4, column=0, padx=12, pady=(6, 12), sticky="nsew")
         subtitle_frame.grid_columnconfigure(0, weight=1)
         subtitle_frame.grid_rowconfigure(1, weight=1)
 
@@ -435,7 +492,7 @@ class SubtitleApp(ctk.CTk):
 
         # -- Status bar --
         status_frame = ctk.CTkFrame(self, fg_color="transparent")
-        status_frame.grid(row=4, column=0, padx=16, pady=(0, 8), sticky="ew")
+        status_frame.grid(row=5, column=0, padx=16, pady=(0, 8), sticky="ew")
         status_frame.grid_columnconfigure(0, weight=1)
 
         self._status_label = ctk.CTkLabel(
@@ -456,6 +513,25 @@ class SubtitleApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
         )
         self._debug_check.grid(row=0, column=1, sticky="e")
+
+    # -- STT method change handler -----------------------------------------
+
+    def _on_stt_method_changed(self, _value: str = ""):
+        stt = self._stt_combo.get()
+        if stt == "OpenAI Whisper API":
+            self._whisper_frame.grid_remove()
+        else:
+            self._whisper_frame.grid()
+            self._update_whisper_hint()
+
+    def _update_whisper_hint(self):
+        stt = self._stt_combo.get()
+        if stt == "Whisper Local (GPU)":
+            self._whisper_hint.configure(text="Requiere GPU NVIDIA + CUDA")
+        elif stt == "Whisper Local (CPU)":
+            self._whisper_hint.configure(text="Sin GPU, más lento")
+        else:
+            self._whisper_hint.configure(text="")
 
     # -- Actions -----------------------------------------------------------
 
@@ -508,13 +584,21 @@ class SubtitleApp(ctk.CTk):
                 self._set_status("⚠ No hay dispositivos de audio disponibles")
                 return
 
+            stt_method = self._stt_combo.get()
+            self._log(f"[DEBUG] Método STT: {stt_method}")
+
             self._log("[DEBUG] Creando TranscriptionService...")
             self._service = TranscriptionService(
                 api_key=api_key,
                 whisper_model=self._whisper_combo.get(),
                 translation_model=self._trans_combo.get(),
+                stt_method=stt_method,
             )
             self._log("[DEBUG] TranscriptionService creado OK")
+
+            # Disable selectors while running
+            self._stt_combo.configure(state="disabled")
+            self._whisper_combo.configure(state="disabled")
 
             # Clear queues
             for q in (self._stt_queue, self._translate_queue):
@@ -540,6 +624,8 @@ class SubtitleApp(ctk.CTk):
                 self._stt_queue.put(None)
                 self._set_status(f"⚠ Error de audio: {e}")
                 self._log(f"[DEBUG] Error en audio.start: {type(e).__name__}: {e}")
+                self._stt_combo.configure(state="readonly")
+                self._whisper_combo.configure(state="readonly")
                 return
 
             self._start_btn.configure(
@@ -559,6 +645,9 @@ class SubtitleApp(ctk.CTk):
         self._start_btn.configure(
             text="▶  Iniciar", fg_color="#2d8a4e", hover_color="#236b3e"
         )
+        # Re-enable selectors
+        self._stt_combo.configure(state="readonly")
+        self._whisper_combo.configure(state="readonly")
         self._set_status("Estado: Detenido")
 
     def _on_audio_chunk(self, wav_bytes: bytes | None, error: str | None, debug_msg: str | None = None):
@@ -583,21 +672,20 @@ class SubtitleApp(ctk.CTk):
     # -- Pipeline workers --------------------------------------------------
 
     def _stt_worker(self):
-        """Thread: loads Whisper model, then transcribes audio chunks."""
-        self.after(0, self._set_status, "⏳ Cargando modelo Whisper...")
-        self.after(0, self._log,
-                   f"[DEBUG] Cargando faster-whisper '{self._service.whisper_model_name}'...")
+        """Thread: loads STT backend, then transcribes audio chunks."""
+        stt_method = self._service.stt_method
+        self.after(0, self._set_status, f"⏳ Cargando STT ({stt_method})...")
+        self.after(0, self._log, f"[DEBUG] Cargando STT: {stt_method}...")
 
         try:
-            device, compute_type = self._service.load_whisper()
+            status = self._service.load_whisper()
         except Exception as e:
             self.after(0, self._log,
-                       f"[ERROR] No se pudo cargar Whisper: {type(e).__name__}: {e}")
+                       f"[ERROR] No se pudo cargar STT: {type(e).__name__}: {e}")
             self.after(0, self._stop_capture)
             return
 
-        self.after(0, self._log,
-                   f"[DEBUG] Whisper cargado (device={device}, compute={compute_type})")
+        self.after(0, self._log, f"[DEBUG] STT listo: {status}")
         self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
 
         while self._is_running:
@@ -622,7 +710,7 @@ class SubtitleApp(ctk.CTk):
                 self.after(0, self._log, f"[ERROR] STT: {type(e).__name__}: {e}")
                 continue
 
-            self.after(0, self._log, f"[DEBUG] Whisper: '{jp_text}'")
+            self.after(0, self._log, f"[DEBUG] STT resultado: '{jp_text}'")
 
             if not jp_text:
                 self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
