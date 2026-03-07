@@ -195,6 +195,7 @@ class AudioCapture:
             chunk_count = 0
             while self._running:
                 try:
+                    rec_start = time.monotonic()
                     data = mic.record(numframes=num_frames)
                     chunk_count += 1
                     audio_float = data[:, 0] if data.ndim > 1 else data
@@ -207,7 +208,7 @@ class AudioCapture:
                         continue
 
                     if self._on_chunk:
-                        self._on_chunk(wav_bytes, None)
+                        self._on_chunk(wav_bytes, None, rec_start=rec_start)
                 except Exception as e:
                     if self._on_chunk and self._running:
                         self._on_chunk(None, f"Error en record: {type(e).__name__}: {e}")
@@ -717,7 +718,8 @@ class SubtitleApp(ctk.CTk):
                 self._audio.start(self._on_audio_chunk, device_name)
             except Exception as e:
                 self._is_running = False
-                self._stt_queue.put(None)
+                for q in self._pipe_queues:
+                    q.put(None)
                 self._set_status(f"⚠ Error de audio: {e}")
                 self._log(f"[DEBUG] Error en audio.start: {type(e).__name__}: {e}")
                 self._stt_combo.configure(state="readonly")
@@ -759,7 +761,8 @@ class SubtitleApp(ctk.CTk):
             self._reset_pipe_timer(pid)
         self._set_status("Estado: Detenido")
 
-    def _on_audio_chunk(self, wav_bytes: bytes | None, error: str | None, debug_msg: str | None = None):
+    def _on_audio_chunk(self, wav_bytes: bytes | None, error: str | None,
+                        debug_msg: str | None = None, rec_start: float | None = None):
         """Called from the audio thread — distributes audio to pipes round-robin."""
         if debug_msg:
             self.after(0, self._log, debug_msg)
@@ -772,13 +775,15 @@ class SubtitleApp(ctk.CTk):
             self.after(0, self._stop_capture)
             return
 
+        # Use recording start time (before mic.record) for accurate timing
+        t0 = rec_start if rec_start is not None else time.monotonic()
+
         # Round-robin: assign chunk to next pipe
-        capture_time = time.monotonic()
         pipe_id = self._next_pipe
         try:
-            self._pipe_queues[pipe_id].put_nowait((wav_bytes, capture_time))
+            self._pipe_queues[pipe_id].put_nowait((wav_bytes, t0))
             self.after(0, self._set_pipe_semaphore, pipe_id, "rec", True)
-            self.after(0, self._start_pipe_timer, pipe_id, capture_time)
+            self.after(0, self._start_pipe_timer, pipe_id, t0)
             self._next_pipe = (self._next_pipe + 1) % self.NUM_PIPES
         except queue.Full:
             self.after(0, self._log,
@@ -813,6 +818,7 @@ class SubtitleApp(ctk.CTk):
     def _pipe_worker(self, pipe_id: int):
         """Thread: full pipeline worker for one pipe (grab → STT → translate)."""
         tag = f"P{pipe_id + 1}"
+        use_local_whisper = self._service.stt_method != "OpenAI Whisper API"
 
         # Wait for STT backend to be ready
         self._stt_ready.wait()
@@ -833,7 +839,7 @@ class SubtitleApp(ctk.CTk):
 
             self._service.update_translation_model(self._trans_combo.get())
 
-            # -- STT phase (serialized via lock for local Whisper) --
+            # -- STT phase --
             self.after(0, self._set_pipe_semaphore, pipe_id, "rec", False)
             self.after(0, self._set_pipe_semaphore, pipe_id, "stt", True)
             self.after(0, self._set_status, f"📝 {tag} Transcribiendo...")
@@ -841,7 +847,11 @@ class SubtitleApp(ctk.CTk):
                        f"[DEBUG] {tag} Transcribiendo ({len(wav_bytes)} bytes)...")
 
             try:
-                with self._stt_lock:
+                # Lock only needed for local Whisper (not thread-safe)
+                if use_local_whisper:
+                    with self._stt_lock:
+                        jp_text = self._service.transcribe(wav_bytes)
+                else:
                     jp_text = self._service.transcribe(wav_bytes)
             except Exception as e:
                 self.after(0, self._set_pipe_semaphore, pipe_id, "stt", False)
@@ -857,26 +867,28 @@ class SubtitleApp(ctk.CTk):
                 self.after(0, self._set_status, "🎧 Capturando audio del sistema...")
                 continue
 
-            # -- Translation phase (display serialized via lock) --
+            # -- Translation phase (parallel: no lock during API call) --
             self.after(0, self._set_pipe_semaphore, pipe_id, "trans", True)
             self.after(0, self._set_status, f"🌐 {tag} Traduciendo...")
 
+            try:
+                tokens = []
+                for token in self._service.translate_stream(jp_text):
+                    tokens.append(token)
+                translation = "".join(tokens)
+            except Exception as e:
+                self.after(0, self._set_pipe_semaphore, pipe_id, "trans", False)
+                self.after(0, self._stop_pipe_timer, pipe_id)
+                self.after(0, self._log,
+                           f"[ERROR] {tag} Traducción: {type(e).__name__}: {e}")
+                continue
+
+            elapsed = time.monotonic() - t0
+
+            # Display atomically (brief lock, only for textbox write)
             with self._display_lock:
-                self.after(0, self._begin_subtitle, jp_text, tag)
-
-                try:
-                    for token in self._service.translate_stream(jp_text):
-                        self.after(0, self._stream_token, token)
-                except Exception as e:
-                    self.after(0, self._set_pipe_semaphore, pipe_id, "trans", False)
-                    self.after(0, self._stop_pipe_timer, pipe_id)
-                    self.after(0, self._log,
-                               f"[ERROR] {tag} Traducción: {type(e).__name__}: {e}")
-                    self.after(0, self._end_subtitle, None)
-                    continue
-
-                elapsed = time.monotonic() - t0
-                self.after(0, self._end_subtitle, elapsed)
+                self.after(0, self._display_complete_subtitle,
+                           jp_text, translation, tag, elapsed)
 
             self.after(0, self._set_pipe_semaphore, pipe_id, "trans", False)
             self.after(0, self._stop_pipe_timer, pipe_id)
@@ -886,29 +898,17 @@ class SubtitleApp(ctk.CTk):
 
     # -- Subtitle display helpers ------------------------------------------
 
-    def _begin_subtitle(self, jp_text: str, tag: str = ""):
-        """Insert the JP line and start the ES line for streaming."""
-        prefix = f"[{tag}] " if tag else ""
+    def _display_complete_subtitle(self, jp_text: str, translation: str,
+                                    tag: str, elapsed: float):
+        """Display a complete subtitle block atomically (no interleaving)."""
+        timing = f"{elapsed:.1f}".replace(".", ",")
+        block = (
+            f"[{tag}] 🇯🇵  {jp_text}\n"
+            f"      🇪🇸  {translation}\n"
+            f"{'─' * 50} ({timing} s)\n\n"
+        )
         self._subtitle_box.configure(state="normal")
-        self._subtitle_box.insert("end", f"{prefix}🇯🇵  {jp_text}\n{' ' * len(prefix)}🇪🇸  ")
-        self._subtitle_box.see("end")
-        self._subtitle_box.configure(state="disabled")
-
-    def _stream_token(self, token: str):
-        """Append a single streamed token to the current ES line."""
-        self._subtitle_box.configure(state="normal")
-        self._subtitle_box.insert("end", token)
-        self._subtitle_box.see("end")
-        self._subtitle_box.configure(state="disabled")
-
-    def _end_subtitle(self, elapsed: float | None):
-        """Close the current subtitle block with separator and optional timing."""
-        self._subtitle_box.configure(state="normal")
-        if elapsed is not None:
-            timing = f"{elapsed:.1f}".replace(".", ",")
-            self._subtitle_box.insert("end", f"\n{'─' * 50} ({timing} s)\n\n")
-        else:
-            self._subtitle_box.insert("end", f"\n{'─' * 60}\n\n")
+        self._subtitle_box.insert("end", block)
         self._subtitle_box.see("end")
         self._subtitle_box.configure(state="disabled")
 
