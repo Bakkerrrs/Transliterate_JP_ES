@@ -5,7 +5,10 @@ import SwiftUI
 @MainActor
 final class TranslatorViewModel: ObservableObject {
 
-    @Published var apiKey = ""
+    /// Se guarda automáticamente en el Keychain al cambiar.
+    @Published var apiKey: String = "" {
+        didSet { KeychainStore.save(apiKey) }
+    }
     @Published var translationModel = translationModels[0]
     @Published var recordingMode: RecordingMode = .vad
     @Published var isRunning = false
@@ -15,8 +18,20 @@ final class TranslatorViewModel: ObservableObject {
     private let audio = AudioCapture()
     private var service: OpenAIService?
 
+    init() {
+        // Asignar en init NO dispara didSet, así no reescribimos el Keychain al cargar.
+        if let saved = KeychainStore.load() {
+            apiKey = saved
+        }
+    }
+
     func toggle() {
         isRunning ? stop() : start()
+    }
+
+    /// Borra la API Key guardada.
+    func clearKey() {
+        apiKey = ""
     }
 
     func start() {

@@ -2,26 +2,43 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var vm = TranslatorViewModel()
-    @State private var showKey = false
+    @State private var editingKey = false
+
+    private var hasSavedKey: Bool {
+        !vm.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
         VStack(spacing: 12) {
 
             // -- API Key --
-            HStack {
-                Group {
-                    if showKey {
-                        TextField("sk-... (OpenAI)", text: $vm.apiKey)
-                    } else {
-                        SecureField("sk-... (OpenAI)", text: $vm.apiKey)
+            if hasSavedKey && !editingKey {
+                // Key ya guardada: nada de pegar de nuevo.
+                HStack {
+                    Image(systemName: "key.fill").foregroundStyle(.green)
+                    Text("API Key guardada").font(.subheadline)
+                    Spacer()
+                    Button("Cambiar") { editingKey = true }.font(.footnote)
+                    Button(role: .destructive) {
+                        vm.clearKey()
+                    } label: {
+                        Text("Borrar").font(.footnote)
                     }
                 }
-                .textFieldStyle(.roundedBorder)
-                .autocorrectionDisabled()
-                .textInputAutocapitalization(.never)
-
-                Button(showKey ? "Ocultar" : "Mostrar") { showKey.toggle() }
-                    .font(.footnote)
+                .padding(10)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                // Pegar la key (solo la primera vez o al cambiarla).
+                HStack {
+                    SecureField("Pega tu API Key de OpenAI (sk-...)", text: $vm.apiKey)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    Button("Guardar") { editingKey = false }
+                        .font(.footnote)
+                        .disabled(!hasSavedKey)
+                }
             }
 
             // -- Selectores --
