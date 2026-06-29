@@ -20,7 +20,12 @@ final class TranslatorViewModel: ObservableObject {
 
     init() {
         // Asignar en init NO dispara didSet, así no reescribimos el Keychain al cargar.
-        if let saved = KeychainStore.load() {
+        // Prioridad: variable de entorno OPENAI_API_KEY (útil al desarrollar desde
+        // Xcode) y, si no existe, la key guardada en el Keychain.
+        if let envKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"],
+           !envKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            apiKey = envKey
+        } else if let saved = KeychainStore.load() {
             apiKey = saved
         }
     }
