@@ -1,17 +1,10 @@
-__pycache__/
-*.pyc
-*.pyo
-.env
-apikey.txt
-venv/
-.venv/
-dist/
-build/
-*.egg-info/
-
 # Xcode / iOS
-ios/build/
-ios/DerivedData/
+build/
+DerivedData/
 **/xcuserdata/
 *.xcuserstate
 .DS_Store
+
+# Secretos
+apikey.txt
+.env
